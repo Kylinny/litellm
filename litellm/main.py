@@ -1129,11 +1129,13 @@ def responses_api_bridge_check(
     #   natively by Chat Completions with reasoning on, so custom-only requests stay on
     #   chat and keep their native custom tool_call response shape.
     # - The UNSET-effort arm only fires against endpoints known to enforce that
-    #   constraint (any api.openai.com host, or Azure OpenAI where api_base is
-    #   always set): chat-only OpenAI-compatible backends registered under the openai
-    #   provider with a custom api_base and gpt-5.4+ model names serve tools without
-    #   reasoning fine and have no /responses route, so they keep pre-existing
-    #   behavior (bridge only on an explicit reasoning_effort).
+    #   constraint (any api.openai.com host, Azure OpenAI where api_base is always
+    #   set, or Databricks, whose Foundation Model APIs host the same OpenAI GPT
+    #   models with reasoning on by default and serve /responses): chat-only
+    #   OpenAI-compatible backends registered under the openai provider with a
+    #   custom api_base and gpt-5.4+ model names serve tools without reasoning fine
+    #   and have no /responses route, so they keep pre-existing behavior (bridge
+    #   only on an explicit reasoning_effort).
     # - Azure AI Foundry's OpenAI v1 hosts (azure_ai provider) enforce it later in the series:
     #   an explicit effort with function tools is rejected from gpt-5.6 on, and the unset
     #   effort only from gpt-6 on (gpt-5.6 serves tools with reasoning silently off), so the
@@ -1163,7 +1165,9 @@ def responses_api_bridge_check(
         model, api_base
     )
     on_constraint_enforcing_endpoint: Final = (
-        custom_llm_provider == "azure" or resolved_api_base == "" or _is_openai_backed_api_base(resolved_api_base)
+        custom_llm_provider in ("azure", "databricks")
+        or resolved_api_base == ""
+        or _is_openai_backed_api_base(resolved_api_base)
     )
     chat_rejects_function_tools: Final = (
         has_function_tool
@@ -1178,7 +1182,7 @@ def responses_api_bridge_check(
         )
     )
     if (
-        (custom_llm_provider in ("openai", "azure") or on_foundry_openai_endpoint)
+        (custom_llm_provider in ("openai", "azure", "databricks") or on_foundry_openai_endpoint)
         and model_info.get("mode") != "responses"
         and OpenAIGPT5Config.is_model_gpt_5_model(model)
         and not OpenAIGPT5Config.is_model_gpt_5_search_model(model)

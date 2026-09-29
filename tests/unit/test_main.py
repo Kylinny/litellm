@@ -1023,6 +1023,83 @@ def test_responses_api_bridge_check_gpt_5_6_tools_with_default_reasoning_routes_
     assert model_info.get("mode") == expected_mode
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        pytest.param("gpt-5.6-sol", id="sol"),
+        pytest.param("gpt-5.6-luna", id="luna"),
+        pytest.param("gpt-5.6-terra", id="terra"),
+    ],
+)
+def test_responses_api_bridge_check_databricks_gpt_5_6_tools_with_default_reasoning_routes_to_responses(
+    monkeypatch, model_name
+):
+    """
+    Databricks-hosted gpt-5.6 family models with function tools and UNSET
+    reasoning_effort must bridge to Responses: Databricks serves the same OpenAI
+    GPT models with reasoning on by default, and its Chat Completions rejects
+    function tools while reasoning is on, same as api.openai.com.
+    """
+    import litellm
+    from litellm.main import responses_api_bridge_check
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setattr(litellm, "api_base", None)
+
+    with patch("litellm.main._get_model_info_helper") as mock_get_model_info:
+        mock_get_model_info.side_effect = lambda **kwargs: {"max_tokens": 128000}
+        model_info, model = responses_api_bridge_check(
+            model=model_name,
+            custom_llm_provider="databricks",
+            tools=[{"type": "function", "function": {"name": "get_capital"}}],
+            reasoning_effort=None,
+        )
+
+    assert model == model_name
+    assert model_info.get("mode") == "responses"
+
+
+def test_responses_api_bridge_check_databricks_gpt_5_6_tools_with_reasoning_none_stays_chat():
+    """
+    The documented reasoning_effort "none" escape hatch keeps Databricks
+    function-tool calls on Chat Completions; the bridge must not fire.
+    """
+    from litellm.main import responses_api_bridge_check
+
+    with patch("litellm.main._get_model_info_helper") as mock_get_model_info:
+        mock_get_model_info.return_value = {"max_tokens": 128000}
+        model_info, model = responses_api_bridge_check(
+            model="gpt-5.6-sol",
+            custom_llm_provider="databricks",
+            tools=[{"type": "function", "function": {"name": "get_capital"}}],
+            reasoning_effort="none",
+        )
+
+    assert model == "gpt-5.6-sol"
+    assert model_info.get("mode") != "responses"
+
+
+def test_responses_api_bridge_check_databricks_non_gpt_model_with_tools_stays_chat():
+    """
+    The bridge is scoped to GPT reasoning-series models; a Databricks-hosted
+    non-GPT model with function tools must keep its existing chat routing.
+    """
+    from litellm.main import responses_api_bridge_check
+
+    with patch("litellm.main._get_model_info_helper") as mock_get_model_info:
+        mock_get_model_info.return_value = {"max_tokens": 128000}
+        model_info, model = responses_api_bridge_check(
+            model="databricks-meta-llama-3-3-70b-instruct",
+            custom_llm_provider="databricks",
+            tools=[{"type": "function", "function": {"name": "get_capital"}}],
+            reasoning_effort=None,
+        )
+
+    assert model == "databricks-meta-llama-3-3-70b-instruct"
+    assert model_info.get("mode") != "responses"
+
+
 def test_responses_api_bridge_check_gpt_5_4_tools_with_reasoning_none_stays_chat():
     """
     Explicit reasoning_effort "none" is OpenAI's documented escape hatch that keeps
