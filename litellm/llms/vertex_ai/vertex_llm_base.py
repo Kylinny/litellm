@@ -657,7 +657,7 @@ class VertexBase:
                 # For Gemini (Google AI Studio), construct the full path like other providers
                 if model is None:
                     raise ValueError("Model parameter is required for Gemini custom API base URLs")
-                url = f"{api_base}/models/{model}:{endpoint}"
+                url = f"{api_base.rstrip('/')}/models/{model}:{endpoint}"
                 if gemini_api_key is None:
                     raise ValueError(
                         "Missing Gemini API key. Set the GEMINI_API_KEY or GOOGLE_API_KEY environment variable."

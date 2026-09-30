@@ -888,6 +888,47 @@ class TestVertexBase:
                 result_url == expected_url
             ), f"Expected {expected_url}, got {result_url} for model {model}"
 
+    def test_check_custom_proxy_gemini_trailing_slash_api_base(self):
+        """Test that a trailing slash on the api_base does not produce a double slash in the Gemini URL"""
+        vertex_base = VertexBase()
+
+        for stream in (False, True):
+            _, result_url = vertex_base._check_custom_proxy(
+                api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
+                custom_llm_provider="gemini",
+                gemini_api_key="fake-api-key",
+                endpoint="generateContent",
+                stream=stream,
+                auth_header=None,
+                url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+                model="gemini-3.8-flash",
+            )
+            expected_url = "https://generativelanguage.googleapis.com/v1beta/openai/models/gemini-3.8-flash:generateContent"
+            if stream:
+                expected_url += "?alt=sse"
+            assert (
+                result_url == expected_url
+            ), f"Expected {expected_url}, got {result_url} for stream={stream}"
+
+    def test_check_custom_proxy_gemini_api_base_without_trailing_slash_unchanged(self):
+        """Test that an api_base without a trailing slash builds the same URL as before the fix"""
+        vertex_base = VertexBase()
+
+        _, result_url = vertex_base._check_custom_proxy(
+            api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+            custom_llm_provider="gemini",
+            gemini_api_key="fake-api-key",
+            endpoint="generateContent",
+            stream=None,
+            auth_header=None,
+            url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+            model="gemini-3.8-flash",
+        )
+        assert (
+            result_url
+            == "https://generativelanguage.googleapis.com/v1beta/openai/models/gemini-3.8-flash:generateContent"
+        ), f"Got unexpected URL {result_url}"
+
     def test_check_custom_proxy_streaming_parameter(self):
         """Test that streaming parameter correctly adds ?alt=sse to URLs"""
         vertex_base = VertexBase()
