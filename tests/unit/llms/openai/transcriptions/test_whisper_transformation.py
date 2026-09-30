@@ -15,7 +15,7 @@ from litellm.llms.openai.transcriptions.whisper_transformation import (
 
 
 class TestWhisperTransformRequestResponseFormat:
-    def _transform(self, optional_params: dict) -> dict:
+    def _transform(self, optional_params: dict, litellm_params: dict | None = None) -> dict:
         config = OpenAIWhisperAudioTranscriptionConfig()
         audio_file = io.BytesIO(b"fake audio")
         audio_file.name = "test.wav"
@@ -23,7 +23,7 @@ class TestWhisperTransformRequestResponseFormat:
             model="whisper-1",
             audio_file=audio_file,
             optional_params=optional_params,
-            litellm_params={},
+            litellm_params=litellm_params or {},
         )
         return result.data
 
@@ -45,6 +45,22 @@ class TestWhisperTransformRequestResponseFormat:
     def test_preserves_verbose_json_when_set(self):
         """verbose_json explicitly set by the caller stays as-is."""
         data = self._transform({"response_format": "verbose_json"})
+        assert data["response_format"] == "verbose_json"
+
+    def test_model_level_default_used_when_request_unset(self):
+        """A model-level response_format in litellm_params replaces the verbose_json default."""
+        data = self._transform({}, litellm_params={"response_format": "json"})
+        assert data["response_format"] == "json"
+
+    def test_request_level_override_beats_model_level_default(self):
+        """An explicit request response_format wins over the model-level default."""
+        data = self._transform({"response_format": "text"}, litellm_params={"response_format": "json"})
+        assert data["response_format"] == "text"
+
+    @pytest.mark.parametrize("bad_default", ["", None, {"format": "json"}])
+    def test_invalid_model_level_default_falls_back_to_verbose_json(self, bad_default):
+        """Empty or non-string model-level defaults are ignored; verbose_json is kept for cost calc."""
+        data = self._transform({}, litellm_params={"response_format": bad_default})
         assert data["response_format"] == "verbose_json"
 
 

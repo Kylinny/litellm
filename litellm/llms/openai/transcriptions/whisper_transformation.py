@@ -107,7 +107,12 @@ class OpenAIWhisperAudioTranscriptionConfig(BaseAudioTranscriptionConfig):
         data: Final = {"model": model, "file": audio_file, **optional_params}
 
         if "response_format" not in data:
-            data["response_format"] = "verbose_json"  # ensures 'duration' is received - used for cost calculation
+            # Model-level default first; verbose_json last so 'duration' is
+            # still received for cost calculation when nothing is configured.
+            model_default: Final = litellm_params.get("response_format")
+            data["response_format"] = (
+                model_default if isinstance(model_default, str) and model_default else "verbose_json"
+            )
 
         return AudioTranscriptionRequestData(
             data=data,
