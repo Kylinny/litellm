@@ -1171,3 +1171,54 @@ async def test_plain_text_stream_announces_exactly_one_message_item(sync_mode: b
             ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
         ):
             assert event.item_id == message_item_adds[0].item.id
+
+
+@pytest.mark.asyncio
+async def test_reasoning_output_item_done_carries_signed_thinking_blocks():
+    """Regression test for https://github.com/BerriAI/litellm/issues/44657.
+
+    The reasoning item in response.output_item.done must carry the same
+    encrypted_content as the response.completed snapshot, so clients that
+    build replay history from output_item.done send signed thinking back
+    instead of replaying unsigned thinking that Bedrock drops on tool turns.
+    """
+    iterator: Final = _build_iterator([_signature_only_thinking_chunk("sig_44657"), _chunk("4", finish_reason="stop")])
+
+    events: Final = await _collect_events(iterator, sync_mode=False)
+
+    done_item: Final = next(
+        event.item
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        and getattr(getattr(event, "item", None), "type", None) == "reasoning"
+    )
+    completed: Final = next(
+        event for event in events if getattr(event, "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+    )
+    completed_reasoning_item: Final = next(
+        item for item in completed.response.output if getattr(item, "type", None) == "reasoning"
+    )
+    assert json.loads(done_item.encrypted_content) == json.loads(completed_reasoning_item.encrypted_content)
+    assert json.loads(done_item.encrypted_content)[0]["signature"] == "sig_44657"
+    assert done_item.status == "completed"
+    assert done_item.id == completed_reasoning_item.id
+
+
+@pytest.mark.asyncio
+async def test_reasoning_output_item_done_without_thinking_blocks_is_unchanged():
+    """Reasoning items without signed thinking blocks keep the previous shape:
+    no encrypted_content and no status field."""
+    iterator: Final = _build_iterator([_reasoning_chunk("let me think"), _chunk("Hello", finish_reason="stop")])
+
+    events: Final = await _collect_events(iterator, sync_mode=False)
+
+    done_item: Final = next(
+        event.item
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        and getattr(getattr(event, "item", None), "type", None) == "reasoning"
+    )
+    assert getattr(done_item, "encrypted_content", None) is None
+    assert "encrypted_content" not in done_item
+    assert getattr(done_item, "status", None) is None
+    assert "status" not in done_item

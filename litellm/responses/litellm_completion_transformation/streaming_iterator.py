@@ -810,6 +810,17 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             ),
         )
 
+    def _encode_collected_thinking_blocks(self) -> str | None:
+        """
+        Encode the thinking blocks collected so far, using the same path as the
+        response.completed snapshot, so the reasoning output_item.done event
+        carries signed thinking blocks that clients can replay on later turns.
+        """
+        litellm_model_response: Final = self.create_litellm_model_response()
+        if litellm_model_response is None or not litellm_model_response.choices:
+            return None
+        return LiteLLMCompletionResponsesConfig._encode_thinking_blocks(litellm_model_response.choices[0].message)
+
     def create_reasoning_output_item_done_event(
         self,
         reasoning_item_id: str,
@@ -827,31 +838,36 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             "item": {
                 "id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
                 "type": "reasoning",
+                "status": "completed",
                 "summary": [
                     {
                         "type": "summary_text",
                         "text": "**Clarifying the first humans**..."
                     }
-                ]
+                ],
+                "encrypted_content": "[{\\"type\\":\\"thinking\\",\\"signature\\":\\"...\\"}]"
             }
         }
         """
+        item_fields: Final[dict[str, object]] = {
+            "id": reasoning_item_id,
+            "type": "reasoning",
+            "summary": [
+                {
+                    "type": "summary_text",
+                    "text": reasoning_content,
+                }
+            ],
+        }
+        encrypted_content: Final = self._encode_collected_thinking_blocks()
+        if encrypted_content is not None:
+            item_fields["encrypted_content"] = encrypted_content
+            item_fields["status"] = "completed"
         return OutputItemDoneEvent(
             type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
             output_index=0,
             sequence_number=sequence_number,
-            item=BaseLiteLLMOpenAIResponseObject(
-                **{
-                    "id": reasoning_item_id,
-                    "type": "reasoning",
-                    "summary": [
-                        {
-                            "type": "summary_text",
-                            "text": reasoning_content,
-                        }
-                    ],
-                }
-            ),
+            item=BaseLiteLLMOpenAIResponseObject(**item_fields),
         )
 
     def return_default_done_events(
