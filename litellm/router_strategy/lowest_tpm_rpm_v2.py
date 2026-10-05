@@ -51,6 +51,7 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
 
     def __init__(self, router_cache: DualCache, routing_args: dict = {}):
         self.router_cache = router_cache
+        self.router_cache_id = str(id(router_cache))
         self.routing_args = RoutingArgs(**routing_args)
         BaseRoutingStrategy.__init__(
             self,

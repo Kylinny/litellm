@@ -50,6 +50,7 @@ from litellm.router import (
     _responses_stream_holds_event,
 )
 from litellm.router_strategy import simple_shuffle
+from litellm.router_strategy.lowest_latency import LowestLatencyLoggingHandler
 from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
 from litellm.router_utils.cooldown_handlers import _async_get_cooldown_deployments
 from litellm.router_utils.fallback_event_handlers import DISABLE_FALLBACKS_METADATA_KEY
@@ -18548,3 +18549,74 @@ async def test_a_guardrail_verdict_is_neither_retried_nor_fallen_back(verdict: E
             await router.acompletion(model="primary", messages=[{"role": "user", "content": "hi"}])
 
     assert [c.kwargs["metadata"]["model_group"] for c in mock_acompletion.call_args_list] == ["primary"]
+
+
+def test_second_latency_router_registers_own_callback():
+    """
+    https://github.com/BerriAI/litellm/issues/44575
+
+    The callback manager dedups CustomLoggers by class name plus plain
+    attributes. LowestLatencyLoggingHandler had no distinguishing attribute,
+    so a second Router's logger was silently dropped from litellm.callbacks
+    and that router's latency cache never populated. Each router's logger
+    must register separately and record into its own router's cache.
+    """
+    model_list = [
+        {
+            "model_name": "gpt-3.5-turbo",
+            "litellm_params": {"model": "gpt-4o-mini", "api_key": "sk-test"},
+        }
+    ]
+    first = litellm.Router(model_list=model_list, routing_strategy="latency-based-routing")
+    second = litellm.Router(model_list=model_list, routing_strategy="latency-based-routing")
+
+    assert first.lowestlatency_logger in litellm.callbacks
+    assert second.lowestlatency_logger in litellm.callbacks
+
+    registered = [c for c in litellm.callbacks if isinstance(c, LowestLatencyLoggingHandler)]
+    assert registered == [first.lowestlatency_logger, second.lowestlatency_logger]
+
+    kwargs = {
+        "litellm_params": {
+            "metadata": {"model_group": "gpt-3.5-turbo"},
+            "model_info": {"id": "deploy-1"},
+        }
+    }
+    start_time = datetime.now()
+    for callback in litellm.callbacks:
+        if isinstance(callback, LowestLatencyLoggingHandler):
+            callback.log_success_event(kwargs, None, start_time, start_time)
+
+    for router in (first, second):
+        cached = router.cache.get_cache(key="gpt-3.5-turbo_map") or {}
+        assert cached["deploy-1"]["latency"] == [0.0]
+
+
+def test_latency_router_stays_registered_after_routing_args_update():
+    """
+    https://github.com/BerriAI/litellm/issues/44575
+
+    Rebuilding the selector for new routing_strategy_args must not drop the
+    logger from litellm.callbacks: the old selector has to be unregistered
+    before the rebuilt one registers, otherwise the callback manager's
+    dedup silently discards the new instance.
+    """
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-3.5-turbo",
+                "litellm_params": {"model": "gpt-4o-mini", "api_key": "sk-test"},
+            }
+        ],
+        routing_strategy="latency-based-routing",
+    )
+    previous = router.lowestlatency_logger
+    assert previous in litellm.callbacks
+
+    router.update_settings(routing_strategy_args={"max_latency_list_size": 20})
+
+    assert router.lowestlatency_logger is not previous
+    assert router.lowestlatency_logger in litellm.callbacks
+    assert previous not in litellm.callbacks
+    registered = [c for c in litellm.callbacks if isinstance(c, LowestLatencyLoggingHandler)]
+    assert registered == [router.lowestlatency_logger]

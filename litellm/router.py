@@ -1423,6 +1423,7 @@ class Router:
             rebuilt: Final = self._build_strategy_selector(
                 strategy=strategy or "",
                 routing_strategy_args=self.routing_strategy_args,
+                register_callbacks=False,
             )
         except (TypeError, ValidationError):
             verbose_router_logger.exception(
@@ -1433,6 +1434,8 @@ class Router:
             return
 
         self._unregister_router_selectors((current,))
+        if rebuilt is not None:
+            self._register_router_selector(rebuilt)
         setattr(self, attr, rebuilt)
 
     def routing_strategy_init(self, routing_strategy: RoutingStrategy | str, routing_strategy_args: dict):

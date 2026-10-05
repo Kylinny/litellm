@@ -18,6 +18,7 @@ class LowestCostLoggingHandler(CustomLogger):
 
     def __init__(self, router_cache: DualCache, routing_args: dict = {}):
         self.router_cache = router_cache
+        self.router_cache_id = str(id(router_cache))
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
         if is_batch_retrieve_call_type(kwargs.get("call_type")):
