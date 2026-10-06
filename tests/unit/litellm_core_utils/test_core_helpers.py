@@ -8,10 +8,12 @@ import pytest
 from litellm.litellm_core_utils.core_helpers import (
     _FINISH_REASON_MAP,
     RESPONSE_COST_HEADER,
+    add_missing_spend_metadata_to_litellm_metadata,
     bind_budget_reservation_to_callbacks,
     budget_reservation_from_metadata,
     drop_params_env_flag,
     drop_params_flag,
+    get_litellm_metadata_from_kwargs,
     get_or_create_metadata_bucket,
     get_provider_response_headers_from_hidden_params,
     map_finish_reason,
@@ -557,3 +559,46 @@ class TestProviderResponseHeadersInHiddenParams:
 
         assert get_provider_response_headers_from_hidden_params(sibling) is None
         assert "additional_headers" not in sibling._hidden_params
+
+
+class TestConcurrentMetadataIteration:
+    """Regression for BerriAI/litellm#44748: /v1/messages answered 500
+    "dictionary changed size during iteration" because the logging thread pool
+    added "hidden_params" to litellm_params["metadata"] while the request path
+    iterated that same dict in add_missing_spend_metadata_to_litellm_metadata."""
+
+    def test_reader_tolerates_concurrent_metadata_writes(self):
+        import threading
+
+        stop = threading.Event()
+        metadata = {"user_api_key": "sk-test"}
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                i += 1
+                metadata[f"hidden_params_{i}"] = {"response_cost": 0.07}
+                if i % 500 == 0:
+                    metadata.clear()
+                    metadata["user_api_key"] = "sk-test"
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        try:
+            kwargs = {
+                "litellm_params": {
+                    "metadata": metadata,
+                    "litellm_metadata": {"litellm_call_id": "abc"},
+                }
+            }
+            for _ in range(2000):
+                get_litellm_metadata_from_kwargs(kwargs)
+        finally:
+            stop.set()
+            writer_thread.join(timeout=5)
+
+    def test_spend_keys_are_copied_from_snapshot(self):
+        litellm_metadata = {}
+        metadata = {"user_api_key": "sk-test", "other": 1}
+        result = add_missing_spend_metadata_to_litellm_metadata(litellm_metadata, metadata)
+        assert result == {"user_api_key": "sk-test"}

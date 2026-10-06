@@ -4059,7 +4059,10 @@ class Logging(LiteLLMLoggingBaseClass):
             "sync_deployment_callback_on_success",
         ]
         if isinstance(cb, str):
-            return False
+            # The response cache registers the "cache" string in litellm.success_callback,
+            # but cache reads/writes go through litellm.cache directly, so the sync
+            # success handler has nothing to do on the logging thread pool (#44748)
+            return cb == "cache"
 
         if not callable(cb):
             return True

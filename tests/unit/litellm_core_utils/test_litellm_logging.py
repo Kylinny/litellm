@@ -9029,3 +9029,32 @@ def test_signoz_dispatch_requires_an_endpoint(monkeypatch):
         logging_module._in_memory_loggers.clear()
         monkeypatch.delenv("LITELLM_OTEL_V2", raising=False)
         is_otel_v2_enabled.cache_clear()
+
+
+def test_should_not_run_sync_callbacks_when_only_cache_string_registered(logging_obj):
+    """BerriAI/litellm#44748: Cache(...) registers the "cache" string in
+    litellm.success_callback, but cache reads/writes go through litellm.cache
+    directly, so submitting the sync success_handler to the logging thread pool
+    only burned a slot and raced the request path on litellm_params["metadata"]."""
+    import litellm
+
+    original_callbacks = list(litellm.success_callback or [])
+    litellm.success_callback = ["cache"]
+    try:
+        assert logging_obj._should_run_sync_callbacks_for_async_calls() is False
+    finally:
+        litellm.success_callback = original_callbacks
+
+
+def test_should_run_sync_callbacks_when_non_internal_callback_present(logging_obj):
+    import litellm
+
+    def real_callback(kwargs, response_obj, start_time, end_time):
+        pass
+
+    original_callbacks = list(litellm.success_callback or [])
+    litellm.success_callback = ["cache", real_callback]
+    try:
+        assert logging_obj._should_run_sync_callbacks_for_async_calls() is True
+    finally:
+        litellm.success_callback = original_callbacks
