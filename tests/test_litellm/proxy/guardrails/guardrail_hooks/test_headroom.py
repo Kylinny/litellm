@@ -1096,6 +1096,364 @@ async def test_responses_request_sends_compressed_input_and_retrieve_tool_upstre
     assert [tool["name"] for tool in result["tools"]] == ["get_weather", HEADROOM_RETRIEVE_TOOL_NAME]
 
 
+def _make_gateway_request(**overrides):
+    request = {
+        "model": "gpt-4o",
+        "previous_response_id": "resp_previous",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call_1",
+                "output": "long shell output",
+            }
+        ],
+    }
+    request.update(overrides)
+    return request
+
+
+def _make_gateway_compress_response(body: dict, status: int = 200) -> MagicMock:
+    mock = MagicMock()
+    mock.status_code = status
+    mock.json.return_value = {
+        "body": body,
+        "tokens_before": 1000,
+        "tokens_after": 100,
+        "compression_ratio": 0.1,
+        "transforms_applied": ["router:smart_crusher:0.35"],
+    }
+    mock.text = ""
+    return mock
+
+
+@pytest.mark.asyncio
+async def test_responses_tool_output_uses_compress_gateway_mode(
+    guardrail: HeadroomGuardrail,
+):
+    """Regression for BerriAI/litellm#44852: a /v1/responses request whose input
+    holds only a tool-output item (text lives in `output`, not `content`) must
+    reach Headroom through /v1/compress gateway mode instead of skipping the
+    guardrail. The native body keeps previous_response_id, call ids, item order
+    and opaque fields; only the visible text is adopted from the service."""
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    data = _make_gateway_request()
+    sent_payload: dict = {}
+
+    async def fake_post(*, url, json, headers):
+        sent_payload.update(json)
+        body = dict(json)
+        body.pop("gateway")
+        body["input"] = [
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call_1",
+                "output": "short shell output",
+            }
+        ]
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.json.return_value = {"body": body}
+        mock.text = ""
+        return mock
+
+    with patch.object(guardrail.async_handler, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = fake_post
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert mock_post.await_count == 1
+    assert sent_payload["gateway"] == {}
+    assert sent_payload["previous_response_id"] == "resp_previous"
+    assert "proxy_server_request" not in sent_payload
+    assert result["previous_response_id"] == "resp_previous"
+    assert result["input"] == [
+        {
+            "type": "local_shell_call_output",
+            "call_id": "call_1",
+            "output": "short shell output",
+        }
+    ]
+    assert [entry["guardrail_status"] for entry in _recorded_guardrail_entries(result)] == ["success"]
+    assert "headroom" in _applied_guardrails(result)
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_preserves_opaque_fields_and_item_order(
+    guardrail: HeadroomGuardrail,
+):
+    """Opaque fields inside input items (e.g. reasoning.encrypted_content) and
+    the relative order of items survive gateway compression untouched."""
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    data = {
+        "model": "gpt-4o",
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "opaque-bytes",
+                "summary": [],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_9",
+                "output": "long tool output",
+            },
+        ],
+    }
+
+    async def fake_post(*, url, json, headers):
+        body = dict(json)
+        body.pop("gateway")
+        body["input"][1]["output"] = "short tool output"
+        return _make_gateway_compress_response(body)
+
+    with patch.object(guardrail.async_handler, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = fake_post
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert mock_post.await_count == 1
+    assert "previous_response_id" not in result
+    assert result["input"][0] == {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "opaque-bytes",
+        "summary": [],
+    }
+    assert result["input"][1] == {
+        "type": "function_call_output",
+        "call_id": "call_9",
+        "output": "short tool output",
+    }
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_bypass_header_skips_compression(
+    guardrail: HeadroomGuardrail,
+):
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    data = _make_gateway_request(
+        proxy_server_request={"headers": {"x-headroom-bypass": "true"}},
+    )
+    original_input = [dict(item) for item in data["input"]]
+
+    with patch.object(guardrail.async_handler, "post", new_callable=AsyncMock) as mock_post:
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+        mock_post.assert_not_called()
+
+    assert result["input"] == original_input
+    assert _recorded_guardrail_entries(result) == []
+    assert "headroom" not in _applied_guardrails(result)
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_background_request_skips_compression(
+    guardrail: HeadroomGuardrail,
+):
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    data = _make_gateway_request(background=True)
+    original_input = [dict(item) for item in data["input"]]
+
+    with patch.object(guardrail.async_handler, "post", new_callable=AsyncMock) as mock_post:
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+        mock_post.assert_not_called()
+
+    assert result["input"] == original_input
+    assert _recorded_guardrail_entries(result) == []
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_fail_open_forwards_uncompressed():
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    guardrail = _make_guardrail(unreachable_fallback="fail_open")
+    data = _make_gateway_request()
+    original_input = [dict(item) for item in data["input"]]
+
+    with patch.object(
+        guardrail.async_handler,
+        "post",
+        new_callable=AsyncMock,
+        return_value=_make_gateway_compress_response({}, status=500),
+    ) as mock_post:
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert mock_post.await_count == 1
+    assert result["input"] == original_input
+    assert [entry["guardrail_status"] for entry in _recorded_guardrail_entries(result)] == [
+        "guardrail_failed_to_respond"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_fail_closed_raises():
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    guardrail = _make_guardrail()
+    data = _make_gateway_request()
+
+    with patch.object(
+        guardrail.async_handler,
+        "post",
+        new_callable=AsyncMock,
+        return_value=_make_gateway_compress_response({}, status=500),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert exc_info.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_missing_body_is_failure(
+    guardrail: HeadroomGuardrail,
+):
+    """A 200 response without the gateway `body` is treated as a service
+    failure, so the fail-open policy still decides instead of adopting garbage."""
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    fail_open = _make_guardrail(unreachable_fallback="fail_open")
+    data = _make_gateway_request()
+    original_input = [dict(item) for item in data["input"]]
+
+    mock = MagicMock()
+    mock.status_code = 200
+    mock.json.return_value = {"tokens_before": 10}
+    mock.text = ""
+
+    with patch.object(fail_open.async_handler, "post", new_callable=AsyncMock, return_value=mock):
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=fail_open)
+
+    assert result["input"] == original_input
+    assert [entry["guardrail_status"] for entry in _recorded_guardrail_entries(result)] == [
+        "guardrail_failed_to_respond"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_item_count_change_is_failure(
+    guardrail: HeadroomGuardrail,
+):
+    """A service that reshapes the input item list cannot have its body adopted:
+    with fail-open the original request goes through untouched."""
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    fail_open = _make_guardrail(unreachable_fallback="fail_open")
+    data = _make_gateway_request()
+    original_input = [dict(item) for item in data["input"]]
+    reshaped_body = {"model": "gpt-4o", "input": []}
+
+    with patch.object(
+        fail_open.async_handler,
+        "post",
+        new_callable=AsyncMock,
+        return_value=_make_gateway_compress_response(reshaped_body),
+    ):
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=fail_open)
+
+    assert result["input"] == original_input
+
+
+@pytest.mark.asyncio
+async def test_responses_gateway_keeps_proxy_internals_out_of_payload(
+    guardrail: HeadroomGuardrail,
+):
+    """litellm-internal request keys must never be sent to the compression
+    service, and the proxy metadata bucket must survive the write-back."""
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    data = _make_gateway_request(
+        proxy_server_request={"headers": {}},
+        litellm_metadata={"user_api_key": "sk-test"},
+        metadata={"user_key": "user_value"},
+    )
+    sent_payload: dict = {}
+
+    async def fake_post(*, url, json, headers):
+        sent_payload.update(json)
+        body = dict(json)
+        body.pop("gateway")
+        return _make_gateway_compress_response(body)
+
+    with patch.object(guardrail.async_handler, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = fake_post
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert mock_post.await_count == 1
+    assert "proxy_server_request" not in sent_payload
+    assert "litellm_metadata" not in sent_payload
+    assert "metadata" not in sent_payload
+    assert sent_payload["input"][0]["output"] == "long shell output"
+    assert result["litellm_metadata"]["user_api_key"] == "sk-test"
+    assert result["metadata"] == {"user_key": "user_value"}
+    assert "headroom" in _applied_guardrails(result)
+
+
+@pytest.mark.asyncio
+async def test_responses_textless_input_without_native_support_is_untouched():
+    """Guardrails without native Responses compression keep the old behavior:
+    a textless request is forwarded unchanged and the guardrail is not run."""
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    guardrail = CustomGuardrail(guardrail_name="plain", default_on=True)
+    data = _make_gateway_request()
+    original = dict(data)
+
+    result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert result == original
+
+
+@pytest.mark.asyncio
+async def test_responses_mixed_input_stays_on_chat_path(
+    guardrail: HeadroomGuardrail,
+):
+    """When the input has extractable text, the existing chat-conversion path
+    is used and the gateway body is never consulted."""
+    from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+
+    data = {
+        "model": "gpt-4o",
+        "input": [
+            {"role": "user", "content": "A" * 5000},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "tool output",
+            },
+        ],
+    }
+    sent_payload: dict = {}
+
+    original_user_content = data["input"][0]["content"]
+    original_tool_output = dict(data["input"][1])
+
+    async def fake_post(*, url, json, headers, **kwargs):
+        sent_payload.update(json)
+        compressed = [
+            {"role": m["role"], "content": "compressed:" + str(m.get("content"))[:10]}
+            for m in json["messages"]
+        ]
+        return _make_compress_response(compressed)
+
+    with patch.object(guardrail.async_handler, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = fake_post
+        result = await OpenAIResponsesHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert mock_post.await_count == 1
+    assert "messages" in sent_payload
+    assert "gateway" not in sent_payload
+    # The lone user turn is the protected last-user row, so the chat path
+    # leaves it alone; the tool result is compressed through the chat path
+    # and written back into its `output` field.
+    assert result["input"][0]["content"] == original_user_content
+    assert result["input"][1]["output"] == "compressed:tool outpu"
+    assert result["input"][1]["call_id"] == original_tool_output["call_id"]
+
+
 @pytest.mark.asyncio
 async def test_apply_guardrail_http_error_raises():
     guardrail = _make_guardrail()

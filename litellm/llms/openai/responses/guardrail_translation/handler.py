@@ -504,7 +504,14 @@ class OpenAIResponsesHandler(BaseTranslation):
         )
         extracted: Final = self._extract_guardrail_inputs(data, input_data, flattened_tool_groups)
         if not extracted.inputs.get("texts"):
-            return data
+            # No scannable text (e.g. tool-output-only input): offer the native
+            # Responses body to guardrails that compress it directly instead of
+            # skipping the guardrail outright. Guardrails without native support
+            # return None and the request is forwarded unchanged.
+            compressed: Final = await guardrail_to_apply.apply_native_responses_compression(
+                request=data, logging_obj=litellm_logging_obj
+            )
+            return compressed if compressed is not None else data
         if structured_messages:
             extracted.inputs["structured_messages"] = structured_messages
         guardrailed_inputs: Final = await guardrail_to_apply.apply_guardrail(

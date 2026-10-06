@@ -1330,6 +1330,23 @@ class CustomGuardrail(CustomLogger):
         """
         return inputs
 
+    async def apply_native_responses_compression(
+        self,
+        request: dict,
+        logging_obj: Optional["LiteLLMLoggingObj"] = None,
+    ) -> dict | None:
+        """
+        Compress a native OpenAI Responses request body without translating it.
+
+        The Responses guardrail translation handler calls this when the request
+        carries no guardrail-scannable text (for example tool-output-only
+        input), so the guardrail is not skipped outright. A guardrail that can
+        compress the native body (Headroom, through /v1/compress gateway mode)
+        overrides this to return the provider-bound request. The default
+        returns None and the request is forwarded unchanged.
+        """
+        return None
+
     def _process_response(
         self,
         response: dict | None,

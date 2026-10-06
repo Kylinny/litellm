@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
@@ -7,7 +8,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Final, Literal, TypeGuard
+from typing import TYPE_CHECKING, ClassVar, Final, Literal, TypeGuard, TypeVar
 
 import httpx
 from fastapi import HTTPException
@@ -46,6 +47,10 @@ from litellm.types.integrations.custom_logger import (
     AgenticLoopPlan,
     AgenticLoopRequestPatch,
 )
+from litellm.types.llms.openai import (
+    ResponsesAPIOptionalRequestParams,
+    ResponsesAPIRequestParams,
+)
 from litellm.types.utils import CallTypes, GenericGuardrailAPIInputs
 
 if TYPE_CHECKING:
@@ -68,6 +73,15 @@ _HASH_CACHE_TTL_SECONDS: Final = 15 * 60
 # untranslated messages can be read with concrete types (values pass through by
 # reference, so this is a shallow top-level reconstruction).
 _REQUEST_DATA_ADAPTER: Final = TypeAdapter(dict[str, object])
+# Responses API fields that may be sent to /v1/compress in gateway mode. This
+# is an allowlist, not a denylist: ``request`` also carries litellm-internal
+# keys (``proxy_server_request``, ``litellm_logging_obj``, ``litellm_metadata``)
+# that must never leave the proxy. ``metadata`` is excluded even though it is a
+# real Responses field, because the proxy reuses that dict as its internal
+# metadata bucket and sending it would leak guardrail log records.
+_GATEWAY_NATIVE_REQUEST_FIELDS: Final = (
+    frozenset(ResponsesAPIOptionalRequestParams.__annotations__) | frozenset(ResponsesAPIRequestParams.__annotations__)
+) - frozenset({"metadata"})
 
 
 def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:  # guard-ok: isinstance narrows correctly; predicate is trivially correct  # fmt: skip
@@ -321,6 +335,46 @@ class _CompressResult:
     ccr_hashes: frozenset[str] = frozenset()
 
 
+@dataclass(frozen=True, slots=True)
+class _GatewayCompressResult:
+    body: dict[str, object]
+    succeeded: bool
+    stats: dict[str, object]
+
+
+def _compress_response_stats(body: Mapping[str, object]) -> dict[str, object]:
+    """Token stats from a /v1/compress response, for spend logging.
+
+    Shared by the chat and gateway response shapes; both carry the counters at
+    the top level of the response body.
+    """
+    stats: Final[dict[str, object]] = {
+        key: body[key]
+        for key in (
+            "tokens_before",
+            "tokens_after",
+            "tokens_saved",
+            "compression_ratio",
+            "transforms_applied",
+        )
+        if key in body
+    }
+    tokens_before: Final = stats.get("tokens_before")
+    tokens_after: Final = stats.get("tokens_after")
+    if (
+        "tokens_saved" not in stats
+        and isinstance(tokens_before, (int, float))
+        and not isinstance(tokens_before, bool)
+        and isinstance(tokens_after, (int, float))
+        and not isinstance(tokens_after, bool)
+    ):
+        # Spend tracking (extract_compression_saved_tokens) reads only
+        # tokens_saved, which the live compression service omits; derive it
+        # so savings are counted, but let a service-sent value win.
+        stats["tokens_saved"] = tokens_before - tokens_after
+    return stats
+
+
 def _build_headroom_retrieve_tool() -> dict[str, object]:
     return {
         "type": "function",
@@ -474,6 +528,9 @@ def _build_responses_followup_items(
     return items
 
 
+_OriginalCompressPayloadT = TypeVar("_OriginalCompressPayloadT")
+
+
 class HeadroomGuardrail(CustomGuardrail):
     records_own_guardrail_information: ClassVar[bool] = True
     server_fulfilled_tool_names: ClassVar[frozenset[str]] = frozenset({HEADROOM_RETRIEVE_TOOL_NAME})
@@ -509,6 +566,7 @@ class HeadroomGuardrail(CustomGuardrail):
             "fail_open" if unreachable_fallback == "fail_open" else "fail_closed"
         )
         self.timeout: httpx.Timeout = self._resolve_timeout(timeout)
+        self._compress_timeout_seconds: float = self._resolve_timeout_seconds(timeout)
         self.ccr_retrieval = ccr_retrieval
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
@@ -538,8 +596,8 @@ class HeadroomGuardrail(CustomGuardrail):
         return headers
 
     @staticmethod
-    def _resolve_timeout(timeout: float | None) -> httpx.Timeout:
-        """Budget for one call to the compression service, unset meaning the default.
+    def _resolve_timeout_seconds(timeout: float | None) -> float:
+        """Seconds budgeted for one call to the compression service, unset meaning the default.
 
         Zero, negative and non-finite values are rejected instead of passed through:
         httpx accepts them, and the transport then reads 0 and inf as no deadline at
@@ -552,13 +610,19 @@ class HeadroomGuardrail(CustomGuardrail):
                 timeout,
                 _COMPRESS_TIMEOUT_SECONDS,
             )
-        seconds: Final = _COMPRESS_TIMEOUT_SECONDS if timeout is None or rejected else timeout
+        return _COMPRESS_TIMEOUT_SECONDS if timeout is None or rejected else timeout
+
+    @staticmethod
+    def _resolve_timeout(timeout: float | None) -> httpx.Timeout:
+        """httpx timeout for one call to the compression service, unset meaning the default."""
+        seconds: Final = HeadroomGuardrail._resolve_timeout_seconds(timeout)
         return httpx.Timeout(timeout=seconds, connect=min(seconds, HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS))
 
     def update_in_memory_litellm_params(self, litellm_params: LitellmParams) -> None:
         """Re-resolve the timeout, which the base implementation would otherwise null out."""
         super().update_in_memory_litellm_params(litellm_params)
         self.timeout = self._resolve_timeout(litellm_params.timeout)
+        self._compress_timeout_seconds = self._resolve_timeout_seconds(litellm_params.timeout)
 
     def _prune_expired_hashes(self) -> None:
         now: Final = time.monotonic()
@@ -570,17 +634,17 @@ class HeadroomGuardrail(CustomGuardrail):
 
     def _handle_compress_failure(
         self,
-        messages: list[dict[str, object]],
+        original: _OriginalCompressPayloadT,
         error: str,
         detail: dict[str, object],
-    ) -> list[dict[str, object]]:
+    ) -> _OriginalCompressPayloadT:
         if self.unreachable_fallback == "fail_open":
             verbose_proxy_logger.critical(
                 "Headroom: %s; fail_open configured, forwarding request uncompressed. detail=%s",
                 error,
                 detail,
             )
-            return messages
+            return original
         raise HTTPException(status_code=502, detail={"error": error, **detail})
 
     async def _call_compress(
@@ -699,31 +763,136 @@ class HeadroomGuardrail(CustomGuardrail):
             body.get("compression_ratio", 0),
         )
 
-        stats: Final = {
-            key: body[key]
-            for key in (
-                "tokens_before",
-                "tokens_after",
-                "tokens_saved",
-                "compression_ratio",
-                "transforms_applied",
-            )
-            if key in body
-        }
-        tokens_before: Final = stats.get("tokens_before")
-        tokens_after: Final = stats.get("tokens_after")
-        if (
-            "tokens_saved" not in stats
-            and isinstance(tokens_before, (int, float))
-            and not isinstance(tokens_before, bool)
-            and isinstance(tokens_after, (int, float))
-            and not isinstance(tokens_after, bool)
-        ):
-            # Spend tracking (extract_compression_saved_tokens) reads only
-            # tokens_saved, which the live compression service omits; derive it
-            # so savings are counted, but let a service-sent value win.
-            stats["tokens_saved"] = tokens_before - tokens_after
+        stats: Final = _compress_response_stats(body)
         return _CompressResult(filtered, True, stats, _read_ccr_hashes(body))
+
+    async def _call_compress_gateway(
+        self,
+        request_body: dict[str, object],
+    ) -> _GatewayCompressResult:
+        """Compress a native OpenAI Responses request through /v1/compress gateway mode.
+
+        The service receives the untouched Responses request with
+        ``"gateway": {}`` and returns the compressed request as ``body``. Only
+        Responses API fields are sent: ``request_body`` also carries
+        litellm-internal keys that must never leave the proxy.
+        """
+        payload: Final[dict[str, object]] = {
+            key: value for key, value in request_body.items() if key in _GATEWAY_NATIVE_REQUEST_FIELDS
+        }
+        payload["gateway"] = {}
+        try:
+            # The gateway wire contract pins post() to url/json/headers, so the
+            # per-call bound rides asyncio instead of the httpx call itself.
+            raw_response: HttpxResponse = await asyncio.wait_for(
+                self.async_handler.post(  # pyright: ignore[reportUnknownMemberType]  # AsyncHTTPHandler.post is untyped
+                    url=f"{self.headroom_api_base}/v1/compress",
+                    json=payload,
+                    headers=self._request_headers(),
+                ),
+                timeout=self._compress_timeout_seconds,
+            )
+        except httpx.HTTPStatusError as e:
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service returned an error",
+                    _build_compress_failure_detail(e.response.status_code, e.response.text),
+                ),
+                False,
+                {},
+            )
+        except (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+            litellm.Timeout,
+            TimeoutError,
+        ) as e:
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service unreachable",
+                    {"detail": str(e)},
+                ),
+                False,
+                {},
+            )
+        response: Final[HttpxResponse] = raw_response
+
+        if response.status_code != 200:
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service returned an error",
+                    _build_compress_failure_detail(response.status_code, response.text),
+                ),
+                False,
+                {},
+            )
+
+        try:
+            response_body: Final[object] = response.json()
+        except ValueError:
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service returned non-JSON response",
+                    {"body": response.text[:500]},
+                ),
+                False,
+                {},
+            )
+        if not _is_str_object_dict(response_body):
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service returned unexpected response shape",
+                    {"body": response.text[:500]},
+                ),
+                False,
+                {},
+            )
+
+        returned_body: Final = response_body.get("body")
+        if not _is_str_object_dict(returned_body):
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service response missing 'body'",
+                    {"body": response.text},
+                ),
+                False,
+                {},
+            )
+
+        sent_input: Final = request_body.get("input")
+        returned_input: Final = returned_body.get("input")
+        if isinstance(sent_input, list) and (
+            not _is_object_list(returned_input) or len(returned_input) != len(sent_input)
+        ):
+            # The compressed input is adopted wholesale, so a reshaped item
+            # list cannot be applied at all.
+            return _GatewayCompressResult(
+                self._handle_compress_failure(
+                    request_body,
+                    "Headroom compression service changed the input item count",
+                    {
+                        "sent": len(sent_input),
+                        "returned": len(returned_input) if _is_object_list(returned_input) else None,
+                    },
+                ),
+                False,
+                {},
+            )
+
+        verbose_proxy_logger.debug(
+            "Headroom: compressed %s tokens -> %s tokens (ratio %.2f)",
+            response_body.get("tokens_before", "?"),
+            response_body.get("tokens_after", "?"),
+            response_body.get("compression_ratio", 0),
+        )
+        return _GatewayCompressResult(returned_body, True, _compress_response_stats(response_body))
 
     async def _call_retrieve(self, hash_value: str, query: str | None = None) -> str:
         params: Final[dict[str, str]] = {}
@@ -876,6 +1045,70 @@ class HeadroomGuardrail(CustomGuardrail):
             merged_tools = list(existing_tools) if isinstance(existing_tools, list) else [retrieve_tool]
 
         return {**inputs, "structured_messages": compressed, "tools": merged_tools}  # pyright: ignore[reportReturnType]
+
+    async def apply_native_responses_compression(
+        self,
+        request: dict[str, object],
+        logging_obj: LiteLLMLoggingObj | None = None,
+    ) -> dict[str, object] | None:
+        """Compress a native OpenAI Responses request through /v1/compress gateway mode.
+
+        Called by the Responses guardrail translation handler when the request
+        carries no guardrail-scannable text (for example tool-output-only
+        input), so the guardrail is not skipped outright. Nothing is translated
+        to chat shape, so ``previous_response_id``, item ``call_id`` pairing,
+        item order, and opaque fields (like ``reasoning.encrypted_content``)
+        survive by construction; only the visible text the service rewrote is
+        adopted.
+
+        Returns the provider-bound request: ``request`` updated in place from
+        the returned ``body`` on success, ``request`` unchanged when compression
+        is bypassed, skipped, or the unreachable fallback is fail-open. Raises
+        HTTPException when the service fails and the fallback is fail-closed.
+        """
+        if self._should_bypass(request):
+            verbose_proxy_logger.debug("Headroom: %s header set; skipping compression", BYPASS_HEADER)
+            return request
+        if request.get("background"):
+            verbose_proxy_logger.debug("Headroom: background request; skipping compression")
+            return request
+
+        start_time: Final = time.time()
+        result: Final = await self._call_compress_gateway(request_body=request)
+        end_time: Final = time.time()
+
+        from litellm.proxy.common_utils.callback_utils import (
+            add_guardrail_to_applied_guardrails_header,
+        )
+
+        if not result.succeeded:
+            self.add_standard_logging_guardrail_information_to_request_data(
+                guardrail_json_response={"error": "headroom compression unavailable; request forwarded uncompressed"},
+                request_data=request,
+                guardrail_status="guardrail_failed_to_respond",
+                guardrail_provider=HEADROOM_GUARDRAIL_PROVIDER,
+                start_time=start_time,
+                end_time=end_time,
+                duration=end_time - start_time,
+            )
+            add_guardrail_to_applied_guardrails_header(request_data=request, guardrail_name=self.guardrail_name)
+            return request
+
+        self.add_standard_logging_guardrail_information_to_request_data(
+            guardrail_json_response=result.stats,
+            request_data=request,
+            guardrail_status="success",
+            guardrail_provider=HEADROOM_GUARDRAIL_PROVIDER,
+            start_time=start_time,
+            end_time=end_time,
+            duration=end_time - start_time,
+        )
+        add_guardrail_to_applied_guardrails_header(request_data=request, guardrail_name=self.guardrail_name)
+
+        for key in _GATEWAY_NATIVE_REQUEST_FIELDS:
+            if key in result.body:
+                request[key] = result.body[key]  # rebind-ok: request is an out-param
+        return request
 
     async def async_pre_call_deployment_hook(
         self,
