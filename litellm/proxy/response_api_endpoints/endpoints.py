@@ -193,6 +193,12 @@ async def _resolve_cursor_model_variant_before_auth(request: Request) -> None:
 
 
 @router.post(
+    "/openai/responses",
+    dependencies=[Depends(user_api_key_auth)],
+    tags=["responses"],
+    responses=RESPONSES_API_CREATE_RESPONSE_SCHEMAS,
+)
+@router.post(
     "/v1/responses",
     dependencies=[Depends(user_api_key_auth)],
     tags=["responses"],
@@ -676,6 +682,12 @@ async def cursor_chat_completions(
 
 
 @router.get(
+    "/openai/responses/{response_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    tags=["responses"],
+    responses=RESPONSES_API_RESPONSE_SCHEMAS,
+)
+@router.get(
     "/v1/responses/{response_id}",
     dependencies=[Depends(user_api_key_auth)],
     tags=["responses"],
@@ -792,6 +804,12 @@ async def get_response(
 
 
 @router.delete(
+    "/openai/responses/{response_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    tags=["responses"],
+    responses=DELETE_RESPONSE_SCHEMAS,
+)
+@router.delete(
     "/v1/responses/{response_id}",
     dependencies=[Depends(user_api_key_auth)],
     tags=["responses"],
@@ -900,6 +918,12 @@ async def delete_response(
         )
 
 
+@router.get(
+    "/openai/responses/{response_id}/input_items",
+    dependencies=[Depends(user_api_key_auth)],
+    tags=["responses"],
+    responses=RESPONSE_ITEM_LIST_SCHEMAS,
+)
 @router.get(
     "/v1/responses/{response_id}/input_items",
     dependencies=[Depends(user_api_key_auth)],
@@ -1127,6 +1151,11 @@ def _responses_input_as_token_count_messages(
 
 
 @router.post(
+    "/openai/responses/input_tokens",
+    dependencies=(_user_api_key_auth_dep,),
+    tags=_RESPONSES_TAGS,
+)
+@router.post(
     "/v1/responses/input_tokens",
     dependencies=(_user_api_key_auth_dep,),
     tags=_RESPONSES_TAGS,
@@ -1199,6 +1228,11 @@ async def responses_input_tokens(
     return result
 
 
+@router.post(
+    "/openai/responses/{response_id}/cancel",
+    dependencies=[Depends(user_api_key_auth)],
+    tags=["responses"],
+)
 @router.post(
     "/v1/responses/{response_id}/cancel",
     dependencies=[Depends(user_api_key_auth)],

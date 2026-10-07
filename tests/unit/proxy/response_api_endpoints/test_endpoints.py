@@ -2356,7 +2356,12 @@ class TestResponsesInputTokens:
         assert token_request.messages == [{"role": "user", "content": "Hello, how are you?"}]
 
     def test_every_route_alias_is_registered(self):
-        for path in ("/v1/responses/input_tokens", "/responses/input_tokens", "/openai/v1/responses/input_tokens"):
+        for path in (
+            "/v1/responses/input_tokens",
+            "/responses/input_tokens",
+            "/openai/v1/responses/input_tokens",
+            "/openai/responses/input_tokens",
+        ):
             response, _ = self._post_input_tokens({"model": "gpt-4o", "input": "hi"}, path=path)
             assert response.status_code == 200, f"{path}: {response.status_code} {response.text}"
 
@@ -2452,6 +2457,82 @@ class TestResponsesInputTokens:
 
         assert response.status_code == 429, response.text
         assert response.json()["error"]["message"] == "rate limited"
+
+
+class TestOpenAIResponsesAzureStyleRoutes:
+    """The AzureOpenAI SDK sends Responses API calls to /openai/responses with no
+    /v1 segment. These paths must resolve to the Responses router, never to the
+    /openai/{endpoint:path} pass-through that forwards to api.openai.com."""
+
+    _ROUTER_METHODS = ("aresponses", "aget_responses", "adelete_responses", "alist_input_items", "acancel_responses")
+
+    def _router_serving_responses(self) -> MagicMock:
+        served = ResponsesAPIResponse(
+            id="resp_router_123",
+            created_at=1234567890,
+            model="gpt-4o",
+            object="response",
+            output=[],
+        )
+        mock_router = MagicMock()
+        for name in self._ROUTER_METHODS:
+            setattr(mock_router, name, AsyncMock(return_value=served))
+        return mock_router
+
+    @pytest.mark.parametrize(
+        "method,path,router_method",
+        [
+            ("POST", "/openai/responses", "aresponses"),
+            ("GET", "/openai/responses/resp_abc123", "aget_responses"),
+            ("DELETE", "/openai/responses/resp_abc123", "adelete_responses"),
+            ("GET", "/openai/responses/resp_abc123/input_items", "alist_input_items"),
+            ("POST", "/openai/responses/resp_abc123/cancel", "acancel_responses"),
+        ],
+    )
+    def test_azure_style_route_reaches_the_router(
+        self, monkeypatch: pytest.MonkeyPatch, method: str, path: str, router_method: str
+    ):
+        import litellm.proxy.proxy_server as ps
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+        mock_router = self._router_serving_responses()
+        monkeypatch.setattr(ps, "llm_router", mock_router)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        app.dependency_overrides[user_api_key_auth] = _auth_override
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            request_kwargs: dict = (
+                {"json": {"model": "gpt-4o", "input": "hi"}} if method == "POST" else {}
+            )
+            response = client.request(method, path, headers={"Authorization": "Bearer sk-test"}, **request_kwargs)
+        finally:
+            app.dependency_overrides.pop(user_api_key_auth, None)
+
+        assert response.status_code == 200, f"{method} {path}: {response.status_code} {response.text}"
+        assert response.json()["id"] == "resp_router_123"
+        getattr(mock_router, router_method).assert_awaited_once()
+
+    def test_unknown_openai_path_still_reaches_the_passthrough(self, monkeypatch: pytest.MonkeyPatch):
+        import litellm.proxy.proxy_server as ps
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+        mock_router = self._router_serving_responses()
+        monkeypatch.setattr(ps, "llm_router", mock_router)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        app.dependency_overrides[user_api_key_auth] = _auth_override
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            response = client.post(
+                "/openai/v1/does_not_exist_xyz",
+                json={"model": "gpt-4o"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+        finally:
+            app.dependency_overrides.pop(user_api_key_auth, None)
+
+        assert response.status_code == 500, response.text
+        for name in self._ROUTER_METHODS:
+            getattr(mock_router, name).assert_not_awaited()
 
 
 class TestGuardrailBlockedResponsesShape:

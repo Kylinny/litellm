@@ -851,6 +851,9 @@ def normalize_request_route(route: str) -> str:
         (r"^(/responses)/([^/]+)(/input_items)$", r"\1/{response_id}\3"),
         (r"^(/responses)/([^/]+)(/cancel)$", r"\1/{response_id}\3"),
         (r"^(/responses)/([^/]+)$", r"\1/{response_id}"),
+        (r"^(/openai/responses)/([^/]+)(/input_items)$", r"\1/{response_id}\3"),
+        (r"^(/openai/responses)/([^/]+)(/cancel)$", r"\1/{response_id}\3"),
+        (r"^(/openai/responses)/([^/]+)$", r"\1/{response_id}"),
         # Threads API
         (
             r"^(/(?:openai/)?v1/threads)/([^/]+)(/runs)/([^/]+)(/steps)/([^/]+)$",
