@@ -326,6 +326,104 @@ class TestToolUseBlockClosedExactlyOnce:
         }
 
 
+class TestFunctionCallArgumentsDone:
+    """Some backends (e.g. ChatGPT/Codex) send no
+    ``response.function_call_arguments.delta`` events for parallel tool calls and
+    deliver the full arguments string only in
+    ``response.function_call_arguments.done``. The wrapper must surface those
+    arguments as ``input_json_delta`` so streamed ``tool_use`` blocks carry
+    their input."""
+
+    @staticmethod
+    def _codex_parallel_tool_turn() -> list[dict[str, object]]:
+        return [
+            {"type": "response.created"},
+            {
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+            },
+            {
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "fc_2", "call_id": "call_bbb", "name": "get_weather"},
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "arguments": '{"city": "Paris"}',
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_2",
+                "arguments": '{"city": "London"}',
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "status": "completed"},
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "id": "fc_2", "call_id": "call_bbb", "status": "completed"},
+            },
+            {"type": "response.completed"},
+        ]
+
+    @staticmethod
+    def _input_json_deltas(chunks: list) -> list:
+        return [
+            chunk
+            for chunk in chunks
+            if chunk["type"] == "content_block_delta" and chunk["delta"].get("type") == "input_json_delta"
+        ]
+
+    def test_done_without_deltas_emits_input_json_delta_per_parallel_call(self):
+        chunks = _process_all(self._codex_parallel_tool_turn())
+        assert [(c["index"], c["delta"]["partial_json"]) for c in self._input_json_deltas(chunks)] == [
+            (0, '{"city": "Paris"}'),
+            (1, '{"city": "London"}'),
+        ]
+
+    def test_done_after_deltas_does_not_emit_arguments_twice(self):
+        chunks = _process_all(
+            [
+                {"type": "response.created"},
+                {
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+                },
+                {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": '{"city": "'},
+                {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": 'Paris"}'},
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_1",
+                    "arguments": '{"city": "Paris"}',
+                },
+            ]
+        )
+        assert [c["delta"]["partial_json"] for c in self._input_json_deltas(chunks)] == [
+            '{"city": "',
+            'Paris"}',
+        ]
+
+    def test_done_without_a_matching_added_block_emits_nothing(self):
+        chunks = _process_all(
+            [{"type": "response.function_call_arguments.done", "item_id": "fc_9", "arguments": '{"a": 1}'}]
+        )
+        assert chunks == []
+
+    def test_done_with_empty_arguments_emits_nothing(self):
+        chunks = _process_all(
+            [
+                {"type": "response.created"},
+                {
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+                },
+                {"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": ""},
+            ]
+        )
+        assert self._input_json_deltas(chunks) == []
+
+
 class TestProcessEventTextDeltaWithoutOutputItemAdded:
     """Streams that skip response.output_item.added (e.g. LMStudio) must still
     open a text block before any delta and never emit index -1."""

@@ -5020,3 +5020,115 @@ def test_transform_request_drop_params_in_litellm_params_gates_the_prompt_cache_
     )
 
     assert "prompt_cache_breakpoint" not in result["input"][0]["content"][0]
+
+def _codex_parallel_tool_call_events() -> list:
+    """Synthetic ChatGPT/Codex backend stream: parallel tool calls deliver the
+    full arguments only in response.function_call_arguments.done, with zero
+    response.function_call_arguments.delta events."""
+    return [
+        {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}},
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {"type": "function_call", "id": "fc_2", "call_id": "call_bbb", "name": "get_weather"},
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "arguments": '{"city": "Paris"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_2",
+            "output_index": 2,
+            "arguments": '{"city": "London"}',
+        },
+    ]
+
+
+def _streamed_tool_call_arguments(results) -> list:
+    return [
+        (tool_call.index, tool_call.id, tool_call.function.arguments)
+        for result in results
+        for choice in result.choices
+        for tool_call in (choice.delta.tool_calls or [])
+        if tool_call.function is not None and tool_call.function.arguments
+    ]
+
+
+def test_function_call_arguments_done_without_deltas_streams_arguments_per_call():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=None, sync_stream=True)
+    results = [iterator.chunk_parser(chunk) for chunk in _codex_parallel_tool_call_events()]
+
+    assert _streamed_tool_call_arguments(results) == [
+        (0, "call_aaa", '{"city": "Paris"}'),
+        (1, "call_bbb", '{"city": "London"}'),
+    ]
+
+
+def test_function_call_arguments_done_after_deltas_does_not_duplicate_arguments():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=None, sync_stream=True)
+    chunks = [
+        {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}},
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "delta": '{"city": "Paris"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "arguments": '{"city": "Paris"}',
+        },
+    ]
+    results = [iterator.chunk_parser(chunk) for chunk in chunks]
+
+    assert _streamed_tool_call_arguments(results) == [
+        (0, None, '{"city": "Paris"}'),
+    ]
+
+
+def test_function_call_arguments_done_with_empty_arguments_emits_no_tool_call_chunk():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=None, sync_stream=True)
+    chunks = [
+        {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}},
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "arguments": "",
+        },
+    ]
+    results = [iterator.chunk_parser(chunk) for chunk in chunks]
+
+    assert _streamed_tool_call_arguments(results) == []

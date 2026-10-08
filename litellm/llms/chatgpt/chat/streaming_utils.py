@@ -35,6 +35,9 @@ class ChatGPTToolCallNormalizer:
     streaming tool call chunks:
     1. `index` is always 0, even for multiple parallel tool calls
     2. `id` and `name` get repeated in "closing" chunks that shouldn't exist
+    3. for parallel tool calls the full arguments arrive once, in a chunk that
+       reuses an already-seen `id` (derived from
+       `response.function_call_arguments.done`), instead of streaming as deltas
 
     This wrapper normalizes the stream to match the OpenAI spec before yielding
     chunks to the consumer.
@@ -88,8 +91,16 @@ class ChatGPTToolCallNormalizer:
                 self._next_index += 1
                 normalized.append(tc)
             elif tc.id and tc.id in self._seen_ids:
-                # Duplicate "closing" chunk — skip it
-                continue
+                # Seen id: a duplicate "closing" chunk, unless it carries
+                # arguments. Argument-bearing chunks come from
+                # response.function_call_arguments.done (full arguments that
+                # never streamed as deltas); keep them so the args survive.
+                tc_function = getattr(tc, "function", None)
+                tc_arguments = getattr(tc_function, "arguments", None)
+                if not tc_arguments:
+                    continue
+                tc.index = self._seen_ids[tc.id]
+                normalized.append(tc)
             else:
                 # Continuation delta (id=None) — fix index
                 if self._last_id:

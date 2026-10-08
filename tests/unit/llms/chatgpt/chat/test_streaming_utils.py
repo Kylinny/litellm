@@ -201,3 +201,72 @@ class TestChatGPTToolCallNormalizer:
 
         normalizer = ChatGPTToolCallNormalizer(FakeStream())
         assert normalizer.custom_attr == "test_value"
+
+    def test_done_derived_chunk_with_seen_id_and_arguments_is_kept(self):
+        """A chunk that reuses an already-seen tool call id but carries
+        arguments comes from response.function_call_arguments.done (the full
+        arguments for a call that never streamed deltas). It must be kept and
+        attributed to its own call, not dropped as a duplicate closing chunk."""
+        chunks = [
+            # Codex order: every call is introduced before any arguments arrive
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_1", name="get_weather")]),
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_2", name="get_weather")]),
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_1", arguments='{"city": "Paris"}')]),
+            _make_chunk(tool_calls=[_make_tc(index=0, id="call_2", arguments='{"city": "London"}')]),
+        ]
+
+        normalizer = ChatGPTToolCallNormalizer(iter(chunks))
+        results = list(normalizer)
+
+        assert len(results) == 4
+        first_args = results[2].choices[0].delta.tool_calls[0]
+        second_args = results[3].choices[0].delta.tool_calls[0]
+        assert (first_args.index, first_args.function.arguments) == (0, '{"city": "Paris"}')
+        assert (second_args.index, second_args.function.arguments) == (1, '{"city": "London"}')
+
+    def test_codex_parallel_tool_calls_end_to_end(self):
+        """Raw Codex backend events (no argument deltas) flow through the
+        Responses->chat bridge and the normalizer; each parallel call ends up
+        with its own arguments on its own index."""
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            OpenAiResponsesToChatCompletionStreamIterator,
+        )
+
+        events = [
+            {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}},
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "function_call", "id": "fc_1", "call_id": "call_aaa", "name": "get_weather"},
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {"type": "function_call", "id": "fc_2", "call_id": "call_bbb", "name": "get_weather"},
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "arguments": '{"city": "Paris"}',
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_2",
+                "output_index": 2,
+                "arguments": '{"city": "London"}',
+            },
+        ]
+
+        bridge = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=None, sync_stream=True)
+        normalizer = ChatGPTToolCallNormalizer(iter([bridge.chunk_parser(event) for event in events]))
+        results = list(normalizer)
+
+        per_index_arguments = {}
+        for result in results:
+            for tool_call in result.choices[0].delta.tool_calls or []:
+                arguments = tool_call.function.arguments if tool_call.function else ""
+                if arguments:
+                    per_index_arguments[tool_call.index] = arguments
+
+        assert per_index_arguments == {0: '{"city": "Paris"}', 1: '{"city": "London"}'}

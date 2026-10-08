@@ -1555,6 +1555,14 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         self._chat_completion_id: str | None = None
         self._served_service_tier: str | None = None
         self._tool_call_index_map: dict[int, int] = {}  # mutable-ok: per-stream accumulator state
+        # Output indexes whose tool-call arguments already streamed as deltas. A
+        # response.function_call_arguments.done for one of these must not emit
+        # the arguments again or the chat accumulator would see them twice.
+        self._tool_call_args_delta_output_indexes: set[int] = set()  # mutable-ok: per-stream accumulator state
+        # Responses item_id -> chat tool call id, so a
+        # response.function_call_arguments.done (which carries only item_id) can
+        # be attributed to the right tool call.
+        self._tool_call_id_by_item_id: dict[str, str] = {}  # mutable-ok: per-stream accumulator state
 
     def _handle_string_chunk(
         self, str_line: Union[str, "BaseModel"]
@@ -1595,6 +1603,8 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
     def translate_responses_chunk_to_openai_stream(
         parsed_chunk: dict | BaseModel,
         tool_call_index_map: dict[int, int] | None = None,  # mutable-ok: per-stream state, remapped in place
+        tool_call_args_delta_output_indexes: set[int] | None = None,  # mutable-ok: per-stream state, added to in place
+        tool_call_id_by_item_id: dict[str, str] | None = None,  # mutable-ok: per-stream state, added to in place
     ) -> "ModelResponseStream":
         """
         Translate a Responses API streaming chunk to OpenAI chat completion streaming format.
@@ -1602,6 +1612,9 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         Args:
             parsed_chunk: Dict containing the Responses API event chunk
             tool_call_index_map: Per-stream output_index -> sequential tool_call index map
+            tool_call_args_delta_output_indexes: Per-stream output_indexes whose
+                tool-call arguments already streamed as deltas
+            tool_call_id_by_item_id: Per-stream Responses item_id -> chat tool call id map
 
         Returns:
             ModelResponseStream: OpenAI-formatted streaming chunk
@@ -1658,6 +1671,16 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                 converted: Final = tool_call_dict_from_output_item(output_item, parsed_chunk.get("output_index", 0))
                 provider_specific_fields: Final = converted.get("provider_specific_fields")
 
+                raw_item_id: Final = output_item.get("id")
+                converted_id: Final = converted.get("id")
+                if (
+                    tool_call_id_by_item_id is not None
+                    and isinstance(raw_item_id, str)
+                    and raw_item_id
+                    and converted_id
+                ):
+                    tool_call_id_by_item_id[raw_item_id] = converted_id
+
                 function_chunk: Final = ChatCompletionToolCallFunctionChunk(
                     name=converted["function"]["name"] or None,
                     arguments=converted["function"]["arguments"] or parsed_chunk.get("arguments") or "",
@@ -1692,8 +1715,11 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         ):
             content_part: str | None = parsed_chunk.get("delta", None)
             if content_part:
+                raw_output_index: Final = parsed_chunk.get("output_index", 0)
+                if tool_call_args_delta_output_indexes is not None:
+                    tool_call_args_delta_output_indexes.add(raw_output_index)
                 tool_call_index = OpenAiResponsesToChatCompletionStreamIterator._sequential_tool_call_index(
-                    tool_call_index_map, parsed_chunk.get("output_index", 0)
+                    tool_call_index_map, raw_output_index
                 )
                 return ModelResponseStream(
                     choices=[
@@ -1715,6 +1741,45 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                 )
             else:
                 raise ValueError(f"Chat provider: Invalid function argument delta {parsed_chunk}")
+        elif event_type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE:
+            # Some backends (e.g. ChatGPT/Codex) send no argument deltas for
+            # parallel tool calls and deliver the full arguments string only
+            # here. Emit it as a tool_calls chunk unless deltas already
+            # streamed the arguments, so the chat accumulator sees them once.
+            arguments: Final = parsed_chunk.get("arguments", None)
+            done_output_index: Final = parsed_chunk.get("output_index", 0)
+            args_already_streamed: Final = (
+                tool_call_args_delta_output_indexes is not None
+                and done_output_index in tool_call_args_delta_output_indexes
+            )
+            if isinstance(arguments, str) and arguments and not args_already_streamed:
+                tool_call_index = OpenAiResponsesToChatCompletionStreamIterator._sequential_tool_call_index(
+                    tool_call_index_map, done_output_index
+                )
+                done_item_id: Final = parsed_chunk.get("item_id")
+                done_call_id: Final = (
+                    tool_call_id_by_item_id.get(done_item_id)
+                    if tool_call_id_by_item_id is not None and isinstance(done_item_id, str)
+                    else None
+                )
+                return ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            index=0,
+                            delta=Delta(
+                                tool_calls=[
+                                    ChatCompletionToolCallChunk(
+                                        id=done_call_id,
+                                        index=tool_call_index,
+                                        type="function",
+                                        function=ChatCompletionToolCallFunctionChunk(name=None, arguments=arguments),
+                                    )
+                                ]
+                            ),
+                            finish_reason=None,
+                        )
+                    ]
+                )
         elif event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE:
             # New output item added
             output_item = parsed_chunk.get("item", {})
@@ -1869,7 +1934,10 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         return self._with_served_service_tier(
             self._with_stream_scoped_id(
                 OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
-                    chunk, tool_call_index_map=self._tool_call_index_map
+                    chunk,
+                    tool_call_index_map=self._tool_call_index_map,
+                    tool_call_args_delta_output_indexes=self._tool_call_args_delta_output_indexes,
+                    tool_call_id_by_item_id=self._tool_call_id_by_item_id,
                 )
             )
         )

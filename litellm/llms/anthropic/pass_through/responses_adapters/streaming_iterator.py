@@ -110,6 +110,7 @@ class AnthropicResponsesStreamWrapper:
       response.reasoning_summary_part.added -> content_block_delta (thinking_delta separator)
       response.reasoning_summary_text.delta -> content_block_delta (thinking_delta)
       response.function_call_arguments.delta -> content_block_delta (input_json_delta)
+      response.function_call_arguments.done  -> content_block_delta (input_json_delta, only when no .delta was seen)
       response.output_item.done          -> content_block_delta (signature_delta) + content_block_stop
       response.completed                 -> message_delta + message_stop
       response.failed                    -> error (the stream ends without message_stop)
@@ -131,6 +132,10 @@ class AnthropicResponsesStreamWrapper:
         self._item_id_to_block_index: dict[str, int] = {}
         # Track open function_call items by item_id so we can emit tool_use start
         self._pending_tool_ids: dict[str, str] = {}  # item_id -> call_id / name accumulator
+        # Content block indexes that already received argument deltas. A
+        # response.function_call_arguments.done for one of these blocks must not
+        # emit input_json_delta again or the consumer would see duplicated args.
+        self._tool_args_delta_block_indexes: set[int] = set()  # mutable-ok: per-stream accumulator state
         self._sent_message_start = False
         self._sent_message_stop = False
         self._stream_failed = False
@@ -338,11 +343,43 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
+            if block_idx >= 0:
+                self._tool_args_delta_block_indexes.add(block_idx)
             self._chunk_queue.append(
                 {
                     "type": "content_block_delta",
                     "index": block_idx,
                     "delta": {"type": "input_json_delta", "partial_json": delta},
+                }
+            )
+            return
+
+        # ---- function call arguments done ----
+        # Some backends (e.g. ChatGPT/Codex) send no argument deltas for
+        # parallel tool calls and deliver the full arguments string only in
+        # response.function_call_arguments.done. Emit it as input_json_delta so
+        # streamed tool_use blocks carry their input, but skip it when deltas
+        # already streamed the arguments to avoid duplicating them.
+        if event_type == "response.function_call_arguments.done":
+            item_id = getattr(event, "item_id", None) or (event.get("item_id") if isinstance(event, dict) else None)
+            arguments = getattr(event, "arguments", None) or (
+                event.get("arguments") if isinstance(event, dict) else None
+            )
+            block_idx = (
+                self._item_id_to_block_index.get(item_id, self._current_block_index)
+                if item_id
+                else self._current_block_index
+            )
+            if block_idx < 0 or block_idx in self._tool_args_delta_block_indexes:
+                return
+            if not isinstance(arguments, str) or not arguments:
+                return
+            self._tool_args_delta_block_indexes.add(block_idx)
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "input_json_delta", "partial_json": arguments},
                 }
             )
             return
