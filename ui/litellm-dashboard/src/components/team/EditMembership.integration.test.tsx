@@ -237,6 +237,17 @@ describe("EditMembership submit payload", () => {
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
+  it("submits an untouched Entra guest UPN email without an email error", async () => {
+    const guestEmail = "john.doe_contoso.com#EXT#@ourtenant.onmicrosoft.com";
+    renderEdit(orgMemberConfig, { user_id: "u1", user_email: guestEmail, role: "user" });
+
+    save();
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    expect(submitted().user_email).toBe(guestEmail);
+    expect(screen.queryByText("Please enter a valid email!")).not.toBeInTheDocument();
+  });
+
   it("blocks submission when no role is selected", async () => {
     renderEdit(orgMemberConfig, { user_id: "u1", user_email: "a@b.com", role: "" });
 

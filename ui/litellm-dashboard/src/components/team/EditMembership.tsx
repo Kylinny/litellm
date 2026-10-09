@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { UiLoadingSpinner } from "@/components/ui/ui-loading-spinner";
 import { UtcDateTimeInput } from "@/components/shared/form/UtcDateTimeInput";
 import { useZodForm } from "@/lib/forms/useZodForm";
+import { isEmailish } from "./emailValidation";
 import {
   buildMemberFormData,
   buildMemberFormValues,
@@ -47,8 +48,6 @@ interface MemberModalProps<T extends BaseMember> {
 }
 
 const ROLE_REQUIRED_MESSAGE = "Please select a role!";
-
-const isEmailish = (value: string): boolean => value === "" || z.email().safeParse(value).success;
 
 const memberFieldSchema = z.union([z.string(), z.number(), z.null(), z.array(z.string())]).optional();
 
