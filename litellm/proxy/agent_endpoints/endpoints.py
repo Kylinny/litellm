@@ -67,6 +67,9 @@ from litellm.proxy.agent_endpoints.managed_identity import raise_identity_failur
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.rbac_utils import check_feature_access_for_user
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
+from litellm.proxy.management_helpers.access_group_resource_sync import (
+    sync_access_groups_for_deleted_agent,
+)
 from litellm.proxy.utils import PrismaClient, get_custom_url
 from litellm.repositories.chunked_in import find_many_in
 from litellm.types.agents import (
@@ -1044,6 +1047,8 @@ async def delete_agent(
             raise HTTPException(status_code=404, detail=f"Agent with ID {agent_id} not found in DB.")
 
         await AGENT_REGISTRY.delete_agent_from_db(agent_id=agent_id, prisma_client=prisma_client)
+
+        await sync_access_groups_for_deleted_agent(prisma_client, agent_id=agent_id)
 
         AGENT_REGISTRY.deregister_agent(agent_name=existing_agent.get("agent_name"))
 
