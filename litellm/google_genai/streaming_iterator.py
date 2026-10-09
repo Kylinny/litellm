@@ -185,11 +185,26 @@ class AsyncGoogleGenAIGenerateContentStreamingIterator(BaseGoogleGenAIGenerateCo
         # Gemini streamGenerateContent uses SSE line framing; aiter_lines keeps
         # large inlineData payloads (e.g. image/jpeg) intact within one event.
         self.stream_iterator = response.aiter_lines()
+        self._prefetched_chunk: bytes | None = None
 
     def __aiter__(self):
         return self
 
+    async def prefetch_first_chunk(self) -> None:
+        if self._prefetched_chunk is not None:
+            return
+        try:
+            chunk: Final = await _anext_google_genai_sse_chunk(self.stream_iterator)
+        except StopAsyncIteration:
+            return
+        self.collected_chunks.append(chunk)
+        self._prefetched_chunk = chunk
+
     async def __anext__(self):
+        if self._prefetched_chunk is not None:
+            replayed: Final = self._prefetched_chunk
+            self._prefetched_chunk = None
+            return replayed
         try:
             chunk: Final = await _anext_google_genai_sse_chunk(self.stream_iterator)
             self.collected_chunks.append(chunk)

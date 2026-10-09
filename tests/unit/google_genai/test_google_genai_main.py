@@ -52,6 +52,12 @@ def _mock_gemini_post_response():
             }
         ]
     }
+
+    async def _aiter_lines():
+        yield 'data: {"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"}}]}'
+        yield ""
+
+    resp.aiter_lines = _aiter_lines
     return resp
 
 

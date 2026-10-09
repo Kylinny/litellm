@@ -154,3 +154,80 @@ async def test_async_streaming_iterator_forwards_sse_comment_events():
 
     chunk = await iterator.__anext__()
     assert chunk == b": keepalive\n\n"
+
+
+def _prefetchable_iterator(lines: list[str]) -> AsyncGoogleGenAIGenerateContentStreamingIterator:
+    mock_response = MagicMock()
+
+    async def _aiter_lines():
+        for line in lines:
+            yield line
+
+    mock_response.aiter_lines = _aiter_lines
+
+    return AsyncGoogleGenAIGenerateContentStreamingIterator(
+        response=mock_response,
+        model="gemini-test",
+        logging_obj=MagicMock(spec=LiteLLMLoggingObj),
+        generate_content_provider_config=MagicMock(),
+        litellm_metadata={},
+        custom_llm_provider="gemini",
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_iterator_prefetch_replays_first_chunk_without_loss_or_duplication():
+    """A prefetched first event must come back first, exactly once, then the stream continues."""
+    iterator = _prefetchable_iterator(
+        [
+            'data: {"candidates":[{"content":{"parts":[{"text":"pong"}]}}]}',
+            "",
+            'data: {"usageMetadata":{"totalTokenCount":3}}',
+            "",
+        ]
+    )
+
+    await iterator.prefetch_first_chunk()
+
+    first = await iterator.__anext__()
+    assert first == b'data: {"candidates":[{"content":{"parts":[{"text":"pong"}]}}]}\n\n'
+    second = await iterator.__anext__()
+    assert second == b'data: {"usageMetadata":{"totalTokenCount":3}}\n\n'
+    with pytest.raises(StopAsyncIteration):
+        await iterator.__anext__()
+    assert iterator.collected_chunks == [first, second]
+
+
+@pytest.mark.asyncio
+async def test_async_iterator_prefetch_propagates_pre_first_chunk_read_error():
+    """A connection dropped before the first chunk must raise out of prefetch, never be swallowed."""
+    mock_response = MagicMock()
+
+    async def _aiter_lines():
+        raise Exception("Connection closed")
+        yield ""
+
+    mock_response.aiter_lines = _aiter_lines
+
+    iterator = AsyncGoogleGenAIGenerateContentStreamingIterator(
+        response=mock_response,
+        model="gemini-test",
+        logging_obj=MagicMock(spec=LiteLLMLoggingObj),
+        generate_content_provider_config=MagicMock(),
+        litellm_metadata={},
+        custom_llm_provider="gemini",
+    )
+
+    with pytest.raises(Exception, match="Connection closed"):
+        await iterator.prefetch_first_chunk()
+
+
+@pytest.mark.asyncio
+async def test_async_iterator_prefetch_on_empty_stream_stays_exhausted():
+    """Prefetching a stream that ends immediately must leave the iterator exhausted, like before."""
+    iterator = _prefetchable_iterator([])
+
+    await iterator.prefetch_first_chunk()
+
+    with pytest.raises(StopAsyncIteration):
+        await iterator.__anext__()

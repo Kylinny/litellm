@@ -455,8 +455,7 @@ async def agenerate_content_stream(
             )
 
         # Call the handler with async enabled and streaming
-        # Return the coroutine directly for the router to handle
-        return await base_llm_http_handler.generate_content_handler(
+        response: Final = await base_llm_http_handler.generate_content_handler(
             model=setup_result.model,
             contents=contents,
             generate_content_provider_config=setup_result.generate_content_provider_config,
@@ -474,6 +473,14 @@ async def agenerate_content_stream(
             litellm_metadata=kwargs.get("litellm_metadata", {}),
             system_instruction=system_instruction,
         )
+        # Read the first SSE event before returning so a connection the provider
+        # drops before any content reaches the client raises here, inside the
+        # router's retry loop, instead of surfacing later in
+        # proxy_server.async_data_generator where it becomes an SSE error frame
+        # with no retry. Vertex holds response headers until the first token is
+        # ready, so healthy streams pay no extra latency.
+        await response.prefetch_first_chunk()
+        return response
 
     except Exception as e:
         raise litellm.exception_type(
