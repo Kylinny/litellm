@@ -53,7 +53,7 @@ from litellm.types.services import ServiceLoggerPayload, ServiceTypes
 from collections.abc import AsyncIterator
 from litellm.constants import LOGGING_WORKER_MAX_TIME_PER_COROUTINE
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-from litellm.types.utils import ModelResponse
+from litellm.types.utils import Message, ModelResponse
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
 from tests.logging_callback_tests.base_test import BaseLoggingCallbackTest
 
@@ -3264,6 +3264,187 @@ class TestOpenTelemetrySemanticConventions138(unittest.TestCase):
         self.assertEqual(parsed[0]["parts"][0]["type"], "text")
         self.assertEqual(parsed[0]["parts"][0]["content"], "Hello back!")
         self.assertEqual(parsed[0]["finish_reason"], "stop")
+
+    def test_tool_call_dict_message_emits_tool_call_parts(self):
+        """
+        A tool-call assistant message given as a plain dict (content=None)
+        must surface its tool calls as tool_call parts, not an empty parts
+        array.
+
+        Regression test for https://github.com/BerriAI/litellm/issues/45796
+        """
+        otel = OpenTelemetry()
+
+        result = otel._transform_messages_to_otel_semantic_conventions(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"q": "weather"}',
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "role": "assistant",
+                    "parts": [
+                        {
+                            "type": "tool_call",
+                            "name": "lookup",
+                            "arguments": '{"q": "weather"}',
+                            "id": "call_1",
+                        }
+                    ],
+                }
+            ],
+        )
+
+    def test_tool_call_message_object_emits_tool_call_parts(self):
+        """
+        Same as above, but the message is a litellm Message object (what
+        _transform_choices_to_otel_semantic_conventions receives from a
+        ModelResponse), not a plain dict. The old `"tool_calls" in msg`
+        check was False for Message objects, so the calls were dropped
+        entirely.
+
+        Regression test for https://github.com/BerriAI/litellm/issues/45796
+        """
+        otel = OpenTelemetry()
+
+        result = otel._transform_messages_to_otel_semantic_conventions(
+            [
+                Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"q": "x"}'},
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "assistant")
+        self.assertEqual(
+            result[0]["parts"],
+            [
+                {
+                    "type": "tool_call",
+                    "name": "lookup",
+                    "arguments": '{"q": "x"}',
+                    "id": "call_1",
+                }
+            ],
+        )
+
+    def test_single_chunk_streamed_tool_call_records_parts_and_finish_reason(self):
+        """
+        A streamed response whose tool call and finish_reason arrive in a
+        single chunk (reassembled with litellm.stream_chunk_builder exactly
+        like the real streaming path) must record finish_reasons
+        ["tool_calls"] and a tool_call part in gen_ai.output.messages.
+
+        Regression test for https://github.com/BerriAI/litellm/issues/45796
+        """
+        otel = OpenTelemetry()
+        mock_span = MagicMock()
+
+        chunk = ModelResponse(
+            id="chatcmpl-1",
+            object="chat.completion.chunk",
+            created=0,
+            model="m",
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": '{"q": "x"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        )
+        response_obj = litellm.stream_chunk_builder([chunk])
+
+        kwargs = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "optional_params": {},
+            "litellm_params": {"custom_llm_provider": "openai"},
+            "standard_logging_object": {
+                "id": "test-id",
+                "call_type": "completion",
+                "metadata": {},
+            },
+        }
+
+        otel.set_attributes(span=mock_span, kwargs=kwargs, response_obj=response_obj)
+
+        output_messages_calls = [
+            call
+            for call in mock_span.set_attribute.call_args_list
+            if call[0][0] == "gen_ai.output.messages"
+        ]
+        self.assertEqual(
+            len(output_messages_calls),
+            1,
+            "Should have exactly one gen_ai.output.messages attribute",
+        )
+        parsed = json.loads(output_messages_calls[0][0][1])
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["finish_reason"], "tool_calls")
+        self.assertEqual(
+            parsed[0]["parts"],
+            [
+                {
+                    "type": "tool_call",
+                    "name": "lookup",
+                    "arguments": '{"q": "x"}',
+                    "id": "call_1",
+                }
+            ],
+        )
+
+        finish_reasons_calls = [
+            call
+            for call in mock_span.set_attribute.call_args_list
+            if call[0][0] == "gen_ai.response.finish_reasons"
+        ]
+        self.assertEqual(
+            len(finish_reasons_calls),
+            1,
+            "Should have exactly one gen_ai.response.finish_reasons attribute",
+        )
+        self.assertEqual(
+            json.loads(finish_reasons_calls[0][0][1]), ["tool_calls"]
+        )
 
     def test_usage_tokens_use_new_naming_convention(self):
         """

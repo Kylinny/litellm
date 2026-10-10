@@ -2800,8 +2800,21 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             transformed_msg = {"role": role, "parts": parts}
             if "id" in msg:
                 transformed_msg["id"] = msg["id"]
-            if "tool_calls" in msg:
-                transformed_msg["tool_calls"] = msg["tool_calls"]
+            tool_calls: Final = msg.get("tool_calls")
+            if tool_calls:
+                for tool_call in tool_calls:
+                    tc: Final = self._to_dict(tool_call)
+                    if tc is None:
+                        continue
+                    function: Final = self._to_dict(tc.get("function")) or {}
+                    part: Final = {
+                        "type": "tool_call",
+                        "name": function.get("name", ""),
+                        "arguments": function.get("arguments", ""),
+                    }
+                    if tc.get("id"):
+                        part["id"] = tc.get("id")
+                    parts.append(part)
             if "tool_call_id" in msg:
                 transformed_msg["tool_call_id"] = msg["tool_call_id"]
             transformed.append(transformed_msg)
