@@ -426,6 +426,54 @@ async def test_form_data_with_none_metadata():
     assert result["model"] == "whisper-1"
 
 
+def _multipart_form_request(form_fields: dict[str, object]) -> MagicMock:
+    mock_request = MagicMock()
+    mock_request.form = AsyncMock(return_value=FormData(form_fields))
+    mock_request.headers = {"content-type": "multipart/form-data"}
+    mock_request.scope = {}
+    mock_request.state._cached_headers = None
+    return mock_request
+
+
+class TestFormDataFallbackParamsJsonDecoding:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "raw", "expected"),
+        [
+            ("fallbacks", '["backup"]', ["backup"]),
+            ("fallbacks", '[{"primary": ["backup"]}]', [{"primary": ["backup"]}]),
+            ("context_window_fallbacks", '["backup"]', ["backup"]),
+            ("content_policy_fallbacks", '["a", "b"]', ["a", "b"]),
+        ],
+    )
+    async def test_form_fallback_list_param_arrives_json_decoded(self, field, raw, expected):
+        result = await read_request_body(_multipart_form_request({"model": "gpt-image-1", field: raw}))
+        assert result[field] == expected
+        assert result["model"] == "gpt-image-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+    async def test_form_malformed_fallback_param_is_left_as_is(self, field):
+        result = await read_request_body(_multipart_form_request({field: "not-json{{"}))
+        assert result[field] == "not-json{{"
+
+    @pytest.mark.asyncio
+    async def test_form_empty_fallback_param_is_left_as_is(self):
+        result = await read_request_body(_multipart_form_request({"fallbacks": ""}))
+        assert result["fallbacks"] == ""
+
+    @pytest.mark.asyncio
+    async def test_form_already_decoded_fallback_param_is_untouched(self):
+        result = await read_request_body(_multipart_form_request({"fallbacks": ["backup"]}))
+        assert result["fallbacks"] == ["backup"]
+
+    @pytest.mark.asyncio
+    async def test_form_non_fallback_string_fields_are_not_json_decoded(self):
+        result = await read_request_body(_multipart_form_request({"model": "gpt-image-1", "prompt": '["x"]', "n": "2"}))
+        assert result["prompt"] == '["x"]'
+        assert result["n"] == "2"
+
+
 @pytest.mark.asyncio
 async def test_empty_request_body():
     """
