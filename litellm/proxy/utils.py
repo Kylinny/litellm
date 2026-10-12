@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
@@ -4492,6 +4493,23 @@ class _StaleReadEngine:
         return self.wrapper is current and self.generation == current.engine_generation
 
 
+def resolve_database_schema() -> str:
+    """Schema Prisma reads/writes, matching how litellm assembles DATABASE_URL.
+
+    Explicit DATABASE_SCHEMA wins; otherwise the ?schema= param of a pinned
+    DATABASE_URL (the same source of truth Prisma itself reads); else public.
+    """
+    explicit_schema: Final = os.getenv("DATABASE_SCHEMA")
+    if explicit_schema:
+        return explicit_schema
+    database_url: Final = os.getenv("DATABASE_URL")
+    if database_url:
+        schema_values: Final = urllib.parse.parse_qs(urllib.parse.urlsplit(database_url).query).get("schema")
+        if schema_values and schema_values[0]:
+            return schema_values[0]
+    return "public"
+
+
 class PrismaClient:
     spend_log_transactions: list = []
     _spend_log_transactions_lock = asyncio.Lock()
@@ -4766,12 +4784,13 @@ class PrismaClient:
             ]
             required_view: Final = "LiteLLM_VerificationTokenView"
             expected_views_str: Final = ", ".join(f"'{view}'" for view in expected_views)
-            pg_schema: Final = os.getenv("DATABASE_SCHEMA", "public")
-            ret: Final[Sequence[_ViewCountRow]] = await self.db.query_raw(f"""
+            pg_schema: Final = resolve_database_schema()
+            ret: Final[Sequence[_ViewCountRow]] = await self.db.query_raw(
+                f"""
                 WITH existing_views AS (
                     SELECT viewname
                     FROM pg_views
-                    WHERE schemaname = '{pg_schema}' AND viewname IN (
+                    WHERE schemaname = $1 AND viewname IN (
                         {expected_views_str}
                     )
                 )
@@ -4779,7 +4798,9 @@ class PrismaClient:
                     (SELECT COUNT(*) FROM existing_views) AS view_count,
                     ARRAY_AGG(viewname) AS view_names
                 FROM existing_views
-                """)
+                """,
+                pg_schema,
+            )
             expected_total_views: Final = len(expected_views)
             if ret[0]["view_count"] == expected_total_views:
                 verbose_proxy_logger.info("All necessary views exist!")

@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 from unittest.mock import Mock
@@ -3329,3 +3331,99 @@ def test_handle_exception_on_proxy_preserves_auth_error_status_code():
     result = handle_exception_on_proxy(auth_error)
 
     assert int(result.code) == 401, f"Expected 401, got {result.code}"
+
+
+@pytest.mark.parametrize(
+    "database_schema_env, database_url, expected",
+    [
+        ("analytics", "postgresql://u:p@h:5432/db?schema=litellm", "analytics"),
+        (None, "postgresql://u:p@h:5432/db?schema=litellm", "litellm"),
+        (None, "postgresql://u:p@h:5432/db", "public"),
+        (None, None, "public"),
+        (None, "postgresql://u:p@h:5432/db?schema=", "public"),
+        ("", "postgresql://u:p@h:5432/db?schema=litellm", "litellm"),
+        (
+            None,
+            "postgresql://u:p@h:5432/db?schema=my%20schema&pool_timeout=10",
+            "my schema",
+        ),
+    ],
+)
+def test_resolve_database_schema(monkeypatch, database_schema_env, database_url, expected):
+    from litellm.proxy.utils import resolve_database_schema
+
+    if database_schema_env is None:
+        monkeypatch.delenv("DATABASE_SCHEMA", raising=False)
+    else:
+        monkeypatch.setenv("DATABASE_SCHEMA", database_schema_env)
+    if database_url is None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("DATABASE_URL", database_url)
+    assert resolve_database_schema() == expected
+
+
+class _PgViewsOnlyInLitellmSchema:
+    """Stands in for pg_views where the eight UI views live in schema 'litellm' only."""
+
+    VIEW_NAMES = (
+        "LiteLLM_VerificationTokenView",
+        "MonthlyGlobalSpend",
+        "Last30dKeysBySpend",
+        "Last30dModelsBySpend",
+        "MonthlyGlobalSpendPerKey",
+        "MonthlyGlobalSpendPerUserPerKey",
+        "Last30dTopEndUsersSpend",
+        "DailyTagSpend",
+    )
+
+    def __init__(self, views_exist=True):
+        self.views_exist = views_exist
+        self.checked_schema = None
+
+    async def query_raw(self, query, *args):
+        if "pg_views" in query:
+            if "$1" in query:
+                (schema,) = args[:1]
+            else:
+                schema = re.search(r"schemaname\s*=\s*'([^']*)'", query).group(1)
+            self.checked_schema = schema
+            names = list(self.VIEW_NAMES) if self.views_exist and schema == "litellm" else []
+            return [{"view_count": len(names), "view_names": names or None}]
+        if "pg_class" in query:
+            return [{"reltuples": 5}]
+        raise AssertionError("unexpected query: " + query[:100])
+
+
+@pytest.mark.asyncio
+async def test_check_view_exists_uses_schema_from_database_url(monkeypatch, caplog):
+    """#46033: views in a non-public ?schema= must not raise the false missing-views warning."""
+    from litellm.proxy.utils import PrismaClient
+
+    monkeypatch.delenv("DATABASE_SCHEMA", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/db?schema=litellm")
+    db = _PgViewsOnlyInLitellmSchema(views_exist=True)
+    client = PrismaClient.__new__(PrismaClient)
+    client.db = db
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        await client.check_view_exists()
+    assert db.checked_schema == "litellm"
+    assert "Not all views exist in db" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_check_view_exists_warns_for_views_missing_in_database_url_schema(monkeypatch, caplog):
+    """The warning still fires, against the resolved schema, when views are truly absent."""
+    from litellm.proxy.utils import PrismaClient
+
+    monkeypatch.delenv("DATABASE_SCHEMA", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/db?schema=litellm")
+    db = _PgViewsOnlyInLitellmSchema(views_exist=False)
+    client = PrismaClient.__new__(PrismaClient)
+    client.db = db
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        await client.check_view_exists()
+    assert db.checked_schema == "litellm"
+    assert "Not all views exist in db" in caplog.text
+    for view in _PgViewsOnlyInLitellmSchema.VIEW_NAMES:
+        assert view in caplog.text
