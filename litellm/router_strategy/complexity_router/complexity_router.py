@@ -970,6 +970,24 @@ def _extract_prior_turns(
     return tuple(reversed(_turns_within_budget(clamped, budget_chars)))
 
 
+def _deployment_model_name_for_id(model_list: list, model_id: str) -> str | None:
+    """The model group name of the deployment whose model_info id matches, or None.
+
+    Mirrors the deployment lookup DeploymentAffinityCheck performs for Responses API
+    continuity, so the complexity router reuses the same deployment the previous response
+    was served from when it maps into a tier pool.
+    """
+    for deployment in model_list:
+        if not isinstance(deployment, dict):
+            continue
+        model_info: Final = deployment.get("model_info")
+        if not isinstance(model_info, dict) or model_info.get("id") != model_id:
+            continue
+        model_name: Final = deployment.get("model_name")
+        return model_name if isinstance(model_name, str) else None
+    return None
+
+
 def _decision_is_pinnable(decision: StandardLoggingRoutingDecision | None) -> bool:
     """Whether a first-turn decision is worth pinning for the rest of the session.
 
@@ -3596,6 +3614,30 @@ class ComplexityRouter(CustomLogger):
             return None
         return max(matched, key=order.index)
 
+    def _tier_for_previous_response_deployment(self, request_kwargs: dict) -> ComplexityTier | None:
+        """The tier of the deployment that produced the request's previous response, if resolvable.
+
+        A /v1/responses continuation carries no human ask, so `_extract_current_ask_and_system_prompt`
+        returns None and the caller would fall back to the default model. The previous response id
+        encodes the serving deployment's model_info id; when that deployment still exists and its
+        model group sits in a tier pool, the continuation reuses that tier instead.
+        """
+        from litellm.responses.utils import ResponsesAPIRequestUtils
+
+        previous_response_id: Final = request_kwargs.get("previous_response_id")
+        if not isinstance(previous_response_id, str):
+            return None
+        model_id: Final = ResponsesAPIRequestUtils.get_model_id_from_response_id(previous_response_id)
+        if model_id is None:
+            return None
+        model_list: Final = getattr(self.litellm_router_instance, "model_list", None)
+        if not isinstance(model_list, list):
+            return None
+        model_name: Final = _deployment_model_name_for_id(model_list, model_id)
+        if model_name is None:
+            return None
+        return self._tier_for_model(model_name)
+
     def _escalate_tier(self, tier: ComplexityTier | str) -> ComplexityTier | str:
         """Bump a tier one step up to the next-higher configured tier.
 
@@ -4611,6 +4653,49 @@ class ComplexityRouter(CustomLogger):
             update=MappingProxyType({"model": choice.model, "litellm_params": params, "routing_decision": decision})
         )
 
+    async def _route_response_continuation(
+        self,
+        request_kwargs: dict,
+        messages: list[dict[str, object]] | None,
+        resolved_messages: Sequence[Mapping[str, object]] | None,
+    ) -> PreRoutingHookResponse | None:
+        """Route an ask-less /v1/responses continuation to the previous response's tier.
+
+        The agent's tool-continuation requests carry no human ask, so classifying them is
+        wrong twice over: there is nothing to judge, and the default-model fallback ignores
+        the judge's original decision. Reusing the tier of the deployment that produced the
+        referenced response keeps the whole agentic loop on the capable model.
+
+        Returns None when the request carries no previous_response_id, when the id does not
+        decode to a serving deployment, or when that deployment no longer maps into a tier
+        pool; each of those falls through to the default-model fallback so an unreadable
+        continuation never routes somewhere it did not earn.
+        """
+        from litellm.types.router import PreRoutingHookResponse
+
+        tier: Final = self._tier_for_previous_response_deployment(request_kwargs)
+        if tier is None:
+            return None
+        routed_model: Final = await self._pick_model_for_tier(tier, messages, resolved_messages, request_kwargs)
+        verbose_router_logger.info(
+            "ComplexityRouter: routing decision cause=previous_response_continuation, tier=%s, routed_model=%s",
+            _tier_name(tier),
+            routed_model,
+        )
+        tier_params: Final = self._litellm_params_for_model(tier, routed_model)
+        return PreRoutingHookResponse(
+            model=routed_model,
+            messages=messages if messages is not None and len(messages) > 0 else None,
+            routing_decision=self._build_routing_decision(
+                routed_model=routed_model,
+                cause="previous_response_continuation",
+                tier=tier,
+                conversation_continuing=True,
+                tier_litellm_params=tier_params,
+            ),
+            litellm_params=tier_params,
+        )
+
     async def _classify_and_route(
         self,
         model: str,
@@ -4657,6 +4742,11 @@ class ComplexityRouter(CustomLogger):
         classifier_images: Final = self._classifier_image_parts(resolved_messages)
 
         if user_message is None and not classifier_images:
+            continuation: Final = await self._route_response_continuation(
+                request_kwargs, messages, resolved_messages
+            )
+            if continuation is not None:
+                return continuation
             verbose_router_logger.debug("ComplexityRouter: No user message found, routing to default model")
             default_model_first: Final = not self.config.plugins and self.config.default_model
             if default_model_first:

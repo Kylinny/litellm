@@ -3112,6 +3112,11 @@ RoutingDecisionCause = Literal[
     # called. Distinct from "session_affinity_pin", which reports the session_affinity flag pinning
     # every turn including new asks; this cause only appears when session_affinity is off.
     "user_turn_continuation",
+    # A /v1/responses request carrying previous_response_id but no human ask (an agent loop's
+    # tool continuation): the previous response id encodes the serving deployment, so the
+    # request reuses its tier instead of falling back to the default model. Distinct from
+    # "user_turn_continuation", which replays a session-affinity pin keyed on metadata session_id.
+    "previous_response_continuation",
     "default_fallback",
     "keyword",
     "quality_tier",

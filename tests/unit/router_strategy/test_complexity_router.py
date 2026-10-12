@@ -9010,6 +9010,100 @@ class TestRoutingDecisionContents:
         assert "tier" not in response.routing_decision
 
     @pytest.mark.asyncio
+    async def test_tool_continuation_reuses_previous_response_tier(self, mock_router_instance, basic_config):
+        """A Responses API tool-continuation request (previous_response_id set, input carrying
+        only function_call_output items) reuses the tier of the deployment that produced the
+        previous response instead of falling back to the default model (litellm#46048)."""
+        from litellm.responses.utils import ResponsesAPIRequestUtils
+
+        capable_deployment_id = "dep-capable-001"
+        mock_router_instance.model_list = [
+            {
+                "model_name": "efficient-model",
+                "litellm_params": {"model": "azure/efficient"},
+                "model_info": {"id": "dep-efficient-001"},
+            },
+            {
+                "model_name": "capable-model",
+                "litellm_params": {"model": "azure/capable"},
+                "model_info": {"id": capable_deployment_id},
+            },
+        ]
+        router = ComplexityRouter(
+            model_name="test-complexity-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={
+                **basic_config,
+                "tiers": {
+                    "SIMPLE": "efficient-model",
+                    "MEDIUM": "efficient-model",
+                    "COMPLEX": "capable-model",
+                    "REASONING": "capable-model",
+                },
+                "default_model": "efficient-model",
+            },
+        )
+        previous_response_id = ResponsesAPIRequestUtils._build_responses_api_response_id(
+            custom_llm_provider="azure_ai",
+            model_id=capable_deployment_id,
+            response_id="resp-prior",
+        )
+        response = await router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={
+                "previous_response_id": previous_response_id,
+                "input": [
+                    {"type": "function_call_output", "call_id": "call_1", "output": "result 1"},
+                    {"type": "function_call_output", "call_id": "call_2", "output": "result 2"},
+                ],
+            },
+            messages=None,
+            input=[
+                {"type": "function_call_output", "call_id": "call_1", "output": "result 1"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "result 2"},
+            ],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "previous_response_continuation"
+        assert decision["routed_model"] == "capable-model"
+        assert decision["tier"] == "REASONING"
+        assert decision["conversation_continuing"] is True
+
+    @pytest.mark.asyncio
+    async def test_tool_continuation_with_undecodable_response_id_stays_default_fallback(
+        self, mock_router_instance, basic_config
+    ):
+        """A previous_response_id that cannot be decoded (foreign response id, removed
+        deployment) falls through to the existing default-model fallback instead of
+        routing somewhere it did not earn."""
+        mock_router_instance.model_list = []
+        router = ComplexityRouter(
+            model_name="test-complexity-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={**basic_config, "default_model": "efficient-model"},
+        )
+        response = await router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={
+                "previous_response_id": "resp_not_litellm_encoded",
+                "input": [
+                    {"type": "function_call_output", "call_id": "call_1", "output": "result 1"},
+                ],
+            },
+            messages=None,
+            input=[
+                {"type": "function_call_output", "call_id": "call_1", "output": "result 1"},
+            ],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "default_fallback"
+        assert decision["routed_model"] == "efficient-model"
+
+    @pytest.mark.asyncio
     async def test_session_pin_decision(self, mock_router_instance, basic_config):
         mock_router_instance.cache = DualCache()
         router = ComplexityRouter(
